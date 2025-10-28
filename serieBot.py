@@ -190,10 +190,23 @@ def normalize_providers(user_text: str) -> List[str]:
 # =========================
 # Pydantic models (typed I/O)
 # =========================
+# Note: ALLOWED_GENRES will be populated dynamically from TMDB at runtime
+# This is just a fallback for validation
 ALLOWED_GENRES = {"sci-fi","crime","drama","comedy","animation","fantasy","mystery","documentary"}
 ALLOWED_MOOD = {"light-hearted","intense","mind-blowing","comforting","adrenaline-fueled"}
 ALLOWED_DURATION = {"<30m","~45m",">60m"}
 ALLOWED_LANG = {"it","en","any"}
+
+def get_allowed_genres() -> set:
+    """
+    Get the current set of allowed genres from TMDB.
+    Falls back to static set if TMDB unavailable.
+    """
+    try:
+        available = get_available_genres()
+        return set(available) if available else ALLOWED_GENRES
+    except Exception:
+        return ALLOWED_GENRES
 
 class UserPrefs(BaseModel):
     """Holds all user preferences."""
@@ -254,10 +267,11 @@ def validate_prefs(prefs: UserPrefs) -> UserPrefs:
     """Post-process to ensure only valid values make it through."""
     validated_data = {}
     
-    # Validate genre
+    # Validate genre - use dynamic list from TMDB
     if prefs.genre:
         genre_lower = prefs.genre.lower()
-        if genre_lower in ALLOWED_GENRES:
+        allowed_genres = get_allowed_genres()
+        if genre_lower in allowed_genres:
             validated_data['genre'] = genre_lower
         else:
             validated_data['genre'] = None
@@ -330,6 +344,7 @@ class TMDB:
     def __init__(self, api_key: str):
         self.key = api_key
         self._providers_cache: Dict[str, Dict[str,int]] = {}
+        self._genres_cache: Optional[Dict[str, int]] = None  # Cache for genre name -> ID mapping
         self._last_request_time = 0
     
     def _rate_limit(self):
@@ -338,6 +353,80 @@ class TMDB:
         if elapsed < self.RATE_LIMIT_DELAY:
             time.sleep(self.RATE_LIMIT_DELAY - elapsed)
         self._last_request_time = time.time()
+    
+    def get_tv_genres(self) -> Dict[str, int]:
+        """
+        Fetch TV genre list from TMDB API.
+        Returns a dict mapping genre name (lowercase) to genre ID.
+        Caches the result for the session.
+        """
+        if self._genres_cache is not None:
+            logger.debug("Using cached TV genres")
+            return self._genres_cache
+        
+        logger.info("Fetching TV genres from TMDB")
+        self._rate_limit()
+        url = f"{self.BASE}/genre/tv/list"
+        params = {"api_key": self.key, "language": "en-US"}
+        
+        try:
+            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            genres = r.json().get("genres", [])
+            
+            # Build mapping: lowercase name -> ID
+            genre_map = {}
+            for genre in genres:
+                name = genre.get("name", "").lower()
+                genre_id = genre.get("id")
+                if name and genre_id:
+                    genre_map[name] = genre_id
+            
+            # Add common aliases for better UX
+            sci_fi_id = None
+            action_id = None
+            
+            # Find IDs for aliasing
+            for name, gid in genre_map.items():
+                if "science fiction" in name or "fantasy" in name:
+                    sci_fi_id = gid
+                if "action" in name and "adventure" in name:
+                    action_id = gid
+            
+            # Add sci-fi aliases
+            if sci_fi_id:
+                genre_map["sci-fi"] = sci_fi_id
+                genre_map["scifi"] = sci_fi_id
+                genre_map["science fiction"] = sci_fi_id
+                genre_map["fantasy"] = sci_fi_id
+            
+            # Add action/adventure aliases
+            if action_id:
+                genre_map["action"] = action_id
+                genre_map["adventure"] = action_id
+            
+            self._genres_cache = genre_map
+            logger.info(f"Loaded {len(genre_map)} TV genres (including aliases)")
+            logger.debug(f"Available genres: {', '.join(sorted(genre_map.keys()))}")
+            
+            return genre_map
+            
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch TV genres: {e}")
+            # Fallback to basic genre map if API fails
+            logger.warning("Using fallback genre map")
+            fallback = {
+                "sci-fi": 10765,
+                "comedy": 35,
+                "drama": 18,
+                "crime": 80,
+                "animation": 16,
+                "mystery": 9648,
+                "documentary": 99,
+                "fantasy": 10765,
+            }
+            self._genres_cache = fallback
+            return fallback
     
     def region_provider_map(self, region: str) -> Dict[str,int]:
         region = (region or "US").upper()
@@ -388,16 +477,35 @@ class TMDB:
 
 tmdb = TMDB(TMDB_KEY) if TMDB_KEY else None
 
-GENRE_MAP = {
-    "sci-fi": 10765,  # Sci-Fi & Fantasy
-    "comedy": 35,
-    "drama": 18,
-    "crime": 80,
-    "animation": 16,
-    "mystery": 9648,
-    "documentary": 99,
-    "fantasy": 10765,  # shares the Sci-Fi & Fantasy bucket
-}
+def get_genre_id(genre_name: str) -> Optional[int]:
+    """
+    Get TMDB genre ID from genre name.
+    Returns None if genre not found or TMDB not available.
+    """
+    if not tmdb:
+        return None
+    
+    genres = tmdb.get_tv_genres()
+    return genres.get((genre_name or "").lower())
+
+def get_available_genres() -> List[str]:
+    """
+    Get list of available genre names from TMDB.
+    Returns fallback list if TMDB not available.
+    """
+    if not tmdb:
+        return ["sci-fi", "crime", "drama", "comedy", "animation", "fantasy", "mystery", "documentary"]
+    
+    genres = tmdb.get_tv_genres()
+    # Return only main genres, not aliases
+    main_genres = []
+    seen_ids = set()
+    for name, genre_id in sorted(genres.items()):
+        if genre_id not in seen_ids:
+            main_genres.append(name)
+            seen_ids.add(genre_id)
+    
+    return sorted(main_genres)
 
 def mood_bias(mood: str) -> Tuple[List[int], List[int]]:
     mood = (mood or "").lower()
@@ -421,7 +529,9 @@ def build_discover_params(genre, mood, duration, region, language):
         "with_original_language": None if (language == "any") else (language or None),
         "page": 1
     }
-    gid = GENRE_MAP.get((genre or "").lower())
+    
+    # Get genre ID from TMDB
+    gid = get_genre_id(genre) if genre else None
     if gid:
         p["with_genres"] = gid
     
@@ -998,7 +1108,7 @@ class BotSession:
                  f"- We're helping find TV series recommendations\n"
                  f"- Current preferences collected: genre={self.prefs.genre}, mood={self.prefs.mood}, duration={self.prefs.duration}, providers={self.prefs.providers}, language={self.prefs.language}\n"
                  f"- Supported platforms: Netflix, Prime Video, Disney+, Apple TV+, HBO Max, Hulu, and many others\n"
-                 f"- Supported genres: {', '.join(sorted(ALLOWED_GENRES))}\n"
+                 f"- Supported genres: {', '.join(sorted(get_allowed_genres()))}\n"
                  f"- Supported moods: {', '.join(sorted(ALLOWED_MOOD))}\n"
                  f"- Duration options: <30m (short episodes), ~45m (standard), >60m (long episodes)\n"
                  f"- Languages: {', '.join(sorted(ALLOWED_LANG))}"
@@ -1040,7 +1150,7 @@ class BotSession:
             
             collect_chain = (
                 collect_prompt.partial(
-                    genres=", ".join(sorted(ALLOWED_GENRES)),
+                    genres=", ".join(sorted(get_allowed_genres())),
                     moods=", ".join(sorted(ALLOWED_MOOD)),
                     dur=", ".join(sorted(ALLOWED_DURATION)),
                     langs=", ".join(sorted(ALLOWED_LANG)),
@@ -1236,7 +1346,7 @@ class BotSession:
             if not ready_to_search:
                 if self.is_force_search and not prefs_minimal_complete(self.prefs):
                     print("ai> I need a bit more info to search. Please tell me at least a (genre or mood) AND a provider.\n")
-                    print(f"   📝 Available genres: {', '.join(sorted(ALLOWED_GENRES))}")
+                    print(f"   📝 Available genres: {', '.join(sorted(get_allowed_genres()))}")
                     print(f"   🎭 Available moods: {', '.join(sorted(ALLOWED_MOOD))}")
                     print(f"   ⏱️  Duration options: <30m (short), ~45m (standard), >60m (long)")
                     print()
