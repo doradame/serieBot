@@ -383,27 +383,27 @@ class TMDB:
                     genre_map[name] = genre_id
             
             # Add common aliases for better UX
-            sci_fi_id = None
-            action_id = None
+            sci_fi_fantasy_id = None
+            action_adventure_id = None
             
             # Find IDs for aliasing
             for name, gid in genre_map.items():
-                if "science fiction" in name or "fantasy" in name:
-                    sci_fi_id = gid
+                if "sci-fi" in name and "fantasy" in name:
+                    sci_fi_fantasy_id = gid
                 if "action" in name and "adventure" in name:
-                    action_id = gid
+                    action_adventure_id = gid
             
-            # Add sci-fi aliases
-            if sci_fi_id:
-                genre_map["sci-fi"] = sci_fi_id
-                genre_map["scifi"] = sci_fi_id
-                genre_map["science fiction"] = sci_fi_id
-                genre_map["fantasy"] = sci_fi_id
+            # Add sci-fi aliases (all point to "Sci-Fi & Fantasy" genre)
+            if sci_fi_fantasy_id:
+                genre_map["sci-fi"] = sci_fi_fantasy_id
+                genre_map["scifi"] = sci_fi_fantasy_id
+                genre_map["science fiction"] = sci_fi_fantasy_id
+                genre_map["fantasy"] = sci_fi_fantasy_id
             
             # Add action/adventure aliases
-            if action_id:
-                genre_map["action"] = action_id
-                genre_map["adventure"] = action_id
+            if action_adventure_id:
+                genre_map["action"] = action_adventure_id
+                genre_map["adventure"] = action_adventure_id
             
             self._genres_cache = genre_map
             logger.info(f"Loaded {len(genre_map)} TV genres (including aliases)")
@@ -474,6 +474,39 @@ class TMDB:
         res = (r.json().get("results") or {}).get(region.upper(), {})
         flatrate = res.get("flatrate", []) or []
         return [x.get("provider_name") for x in flatrate if x.get("provider_name")]
+    
+    def search_tv_show(self, query: str) -> List[Dict]:
+        """
+        Search for TV shows by name.
+        Returns a list of matching shows with their details.
+        """
+        self._rate_limit()
+        url = f"{self.BASE}/search/tv"
+        p = {"api_key": self.key, "query": query, "language": "en-US"}
+        
+        try:
+            r = requests.get(url, params=p, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            return r.json().get("results", [])
+        except requests.RequestException as e:
+            logger.error(f"Failed to search for TV show '{query}': {e}")
+            return []
+    
+    def get_tv_details(self, tv_id: int) -> Optional[Dict]:
+        """
+        Get detailed information about a specific TV show.
+        """
+        self._rate_limit()
+        url = f"{self.BASE}/tv/{tv_id}"
+        p = {"api_key": self.key, "language": "en-US"}
+        
+        try:
+            r = requests.get(url, params=p, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            logger.error(f"Failed to get TV show details for ID {tv_id}: {e}")
+            return None
 
 tmdb = TMDB(TMDB_KEY) if TMDB_KEY else None
 
@@ -491,21 +524,16 @@ def get_genre_id(genre_name: str) -> Optional[int]:
 def get_available_genres() -> List[str]:
     """
     Get list of available genre names from TMDB.
+    Returns ALL genre names including aliases so users can use any variant.
     Returns fallback list if TMDB not available.
     """
     if not tmdb:
-        return ["sci-fi", "crime", "drama", "comedy", "animation", "fantasy", "mystery", "documentary"]
+        return ["sci-fi", "scifi", "crime", "drama", "comedy", "animation", "fantasy", "mystery", "documentary"]
     
     genres = tmdb.get_tv_genres()
-    # Return only main genres, not aliases
-    main_genres = []
-    seen_ids = set()
-    for name, genre_id in sorted(genres.items()):
-        if genre_id not in seen_ids:
-            main_genres.append(name)
-            seen_ids.add(genre_id)
-    
-    return sorted(main_genres)
+    # Return ALL genre names (including aliases) for better UX
+    # Users can say "sci-fi", "scifi", "fantasy" - all are valid
+    return sorted(genres.keys())
 
 def mood_bias(mood: str) -> Tuple[List[int], List[int]]:
     mood = (mood or "").lower()
@@ -647,6 +675,69 @@ def _score_freshness(first_air_date):
     except (ValueError, IndexError):
         return 0
 
+def _score_quality(vote_average, vote_count, popularity):
+    """
+    Score based on quality metrics: rating, number of votes, and popularity.
+    Returns a quality score that balances all three factors.
+    
+    Args:
+        vote_average: TMDB vote average (0-10)
+        vote_count: Number of votes
+        popularity: TMDB popularity score
+    
+    Returns:
+        float: Quality score (0-10 scale)
+    """
+    # Normalize vote average (already 0-10)
+    rating_score = vote_average if vote_average else 0
+    
+    # Vote count score: logarithmic scale to avoid over-weighting popular shows
+    # 0-100 votes: 0-2 points
+    # 100-1000 votes: 2-4 points
+    # 1000-10000 votes: 4-6 points
+    # 10000+ votes: 6-8 points
+    import math
+    if vote_count:
+        vote_score = min(8, math.log10(max(1, vote_count)) * 2)
+    else:
+        vote_score = 0
+    
+    # Popularity score: normalize to 0-2 scale
+    # TMDB popularity typically ranges 0-100+ but most shows are 0-50
+    if popularity:
+        popularity_score = min(2, popularity / 25)
+    else:
+        popularity_score = 0
+    
+    # Weighted combination:
+    # - Rating: 60% (most important)
+    # - Vote count: 30% (credibility)
+    # - Popularity: 10% (current relevance)
+    total_score = (
+        rating_score * 0.6 +
+        vote_score * 0.3 +
+        popularity_score * 0.1
+    )
+    
+    return round(total_score, 2)
+
+def _add_randomness(base_score, randomness_factor=0.15):
+    """
+    Add controlled randomness to avoid always showing the same results.
+    
+    Args:
+        base_score: The base score to randomize
+        randomness_factor: How much randomness to add (0.0-1.0)
+            0.15 = ±15% variation
+    
+    Returns:
+        float: Score with randomness added
+    """
+    import random
+    # Add random variation: ±randomness_factor of the base score
+    variation = base_score * randomness_factor * (2 * random.random() - 1)
+    return base_score + variation
+
 @tool
 def suggest_series(genre: str, mood: str, duration: str,
                    providers_text: str, language: str, country: str) -> str:
@@ -680,7 +771,7 @@ def suggest_series(genre: str, mood: str, duration: str,
         logger.error(f"Unexpected error during search: {str(e)}", exc_info=True)
         return json.dumps({"error": f"Unexpected error during search: {str(e)}"}, ensure_ascii=False)
     
-    # Build candidate list with genre scoring and freshness bonus
+    # Build candidate list with multi-factor scoring
     scored_candidates = []
     for tv in candidates:
         tv_id = tv.get("id")
@@ -695,30 +786,63 @@ def suggest_series(genre: str, mood: str, duration: str,
         if owned_ids and not where:
             continue
         
-        # Calculate scores
+        # Extract metrics
         tv_genres = tv.get("genre_ids", [])
         first_air = tv.get("first_air_date")
+        vote_average = tv.get("vote_average", 0)
+        vote_count = tv.get("vote_count", 0)
+        popularity = tv.get("popularity", 0)
         
+        # Calculate individual scores
         genre_score = _score_genre_match(tv_genres, genre)
         freshness_score = _score_freshness(first_air)
-        total_score = genre_score + freshness_score
+        quality_score = _score_quality(vote_average, vote_count, popularity)
+        
+        # Combined score with weights:
+        # - Quality: 50% (rating, votes, popularity)
+        # - Genre match: 30% (relevance to request)
+        # - Freshness: 20% (variety and recency)
+        base_score = (
+            quality_score * 0.5 +
+            genre_score * 0.3 +
+            freshness_score * 0.2
+        )
+        
+        # Add controlled randomness for variety (±15%)
+        final_score = _add_randomness(base_score, randomness_factor=0.15)
         
         overview = _trim_overview(tv.get("overview") or "")
         scored_candidates.append({
             "title": tv.get("name"),
             "overview": overview,
-            "vote": tv.get("vote_average"),
+            "vote": vote_average,
+            "vote_count": vote_count,
+            "popularity": popularity,
             "first_air_date": first_air,
             "where": where[:5],
             "genre_score": genre_score,
             "freshness_score": freshness_score,
-            "total_score": total_score,
+            "quality_score": quality_score,
+            "base_score": base_score,
+            "final_score": final_score,
             "genre_ids": tv_genres
         })
     
-    # Sort by total score (genre + freshness), then by vote rating
-    scored_candidates.sort(key=lambda x: (x["total_score"], x.get("vote", 0)), reverse=True)
-    logger.debug(f"Sorted candidates by score: {[(c['title'], c['first_air_date'], 'G:' + str(c['genre_score']) + ' F:' + str(c['freshness_score']) + ' T:' + str(c['total_score'])) for c in scored_candidates[:5]]}")
+    # Sort by final score (includes randomness for variety)
+    scored_candidates.sort(key=lambda x: x["final_score"], reverse=True)
+    
+    # Log top candidates with scoring breakdown
+    logger.debug("Top candidates with scoring breakdown:")
+    for i, c in enumerate(scored_candidates[:5], 1):
+        logger.debug(
+            f"  {i}. {c['title']} ({c['first_air_date']}) - "
+            f"Final: {c['final_score']:.2f} "
+            f"[Quality: {c['quality_score']:.2f}, "
+            f"Genre: {c['genre_score']}, "
+            f"Fresh: {c['freshness_score']}, "
+            f"Votes: {c['vote_count']}, "
+            f"Rating: {c['vote']:.1f}]"
+        )
     
     # Take top 3 and remove scoring metadata
     suggestions = []
@@ -739,6 +863,106 @@ def suggest_series(genre: str, mood: str, duration: str,
         return json.dumps({"country": region, "suggestions": [], "note": msg}, ensure_ascii=False)
     
     return json.dumps({"country": region, "suggestions": suggestions}, ensure_ascii=False)
+
+@tool
+def get_show_info(show_name: str, country: str, providers_text: Optional[str] = None) -> str:
+    """
+    Get detailed information about a specific TV show by name.
+    Returns info about the show including where it's available to watch.
+    
+    Args:
+        show_name: The name of the TV show to search for
+        country: The user's country code (e.g., 'US', 'IT')
+        providers_text: Optional. User's preferred providers to check availability
+    
+    Returns:
+        JSON string with show details and availability info
+    """
+    logger.info(f"Getting info for show: {show_name} in country: {country}")
+    
+    if not tmdb:
+        logger.error("TMDB API key is missing")
+        return json.dumps({"error": "Missing TMDB_API_KEY"}, ensure_ascii=False)
+    
+    region = (country or "US").upper()
+    
+    try:
+        # Search for the show
+        search_results = tmdb.search_tv_show(show_name)
+        
+        if not search_results:
+            logger.info(f"No results found for '{show_name}'")
+            return json.dumps({
+                "error": f"No TV show found matching '{show_name}'",
+                "suggestion": "Try checking the spelling or being more specific"
+            }, ensure_ascii=False)
+        
+        # Get the first (most relevant) result
+        show = search_results[0]
+        show_id = show.get("id")
+        
+        if not show_id:
+            return json.dumps({
+                "error": f"Invalid show data for '{show_name}'"
+            }, ensure_ascii=False)
+        
+        # Get detailed info
+        details = tmdb.get_tv_details(show_id)
+        
+        if not details:
+            return json.dumps({
+                "error": f"Could not retrieve details for '{show_name}'"
+            }, ensure_ascii=False)
+        
+        # Get watch providers
+        try:
+            providers = tmdb.watch_providers_for(show_id, region)
+        except Exception:
+            providers = []
+        
+        # Check if it's available on user's preferred providers
+        user_has_access = False
+        if providers_text:
+            user_prov_norm = normalize_providers(providers_text)
+            user_providers_lower = [p.lower() for p in user_prov_norm]
+            providers_lower = [p.lower() for p in providers]
+            user_has_access = any(up in providers_lower for up in user_providers_lower)
+        
+        # Prepare response
+        response = {
+            "title": details.get("name"),
+            "original_title": details.get("original_name"),
+            "overview": details.get("overview"),
+            "first_air_date": details.get("first_air_date"),
+            "last_air_date": details.get("last_air_date"),
+            "status": details.get("status"),
+            "number_of_seasons": details.get("number_of_seasons"),
+            "number_of_episodes": details.get("number_of_episodes"),
+            "genres": [g.get("name") for g in details.get("genres", [])],
+            "vote_average": details.get("vote_average"),
+            "vote_count": details.get("vote_count"),
+            "popularity": details.get("popularity"),
+            "available_on": providers,
+            "user_has_access": user_has_access,
+            "country": region,
+            "episode_runtime": details.get("episode_run_time", []),
+            "homepage": details.get("homepage"),
+            "in_production": details.get("in_production"),
+            "languages": details.get("languages", []),
+            "networks": [n.get("name") for n in details.get("networks", [])]
+        }
+        
+        logger.info(f"Found show: {response['title']}, Available on: {providers}, User has access: {user_has_access}")
+        
+        return json.dumps(response, ensure_ascii=False)
+        
+    except requests.RequestException as e:
+        logger.error(f"TMDB API error while getting show info: {str(e)}")
+        return json.dumps({"error": f"Failed to retrieve show information: {str(e)}"}, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Unexpected error getting show info: {str(e)}", exc_info=True)
+        return json.dumps({"error": f"Unexpected error: {str(e)}"}, ensure_ascii=False)
+
 
 # =========================
 # LLM + LCEL components
@@ -805,7 +1029,7 @@ collect_parser = PydanticOutputParser(pydantic_object=CollectResult)
 # Note: We'll dynamically add current preferences when invoking the chain
 
 # Tools-enabled model
-assistant_with_tools = llm_base.bind_tools([ipinfo_location, suggest_series])
+assistant_with_tools = llm_base.bind_tools([ipinfo_location, suggest_series, get_show_info])
 
 # 3) LCEL Prompt for final response formatting
 final_prompt = ChatPromptTemplate.from_messages([
@@ -1050,7 +1274,21 @@ class BotSession:
                      "• Type 'exit' to quit")
             return True, next_q
         
-        # Not feedback, turn off feedback mode
+        # Check if it's a question about a specific show or informational question
+        # Keep feedback mode active and answer the question
+        if self.is_informational_question(user_input) or self._is_show_question(user_input):
+            # Answer the question but stay in feedback mode
+            self.answer_informational_question(user_input)
+            # Return the same feedback prompt
+            next_q = ("How do these look? Please rate:\n"
+                     "• 👍 (or type 'good', 'like', 'yes') if you liked them\n"
+                     "• 👎 (or type 'bad', 'dislike', 'no') if you didn't\n"
+                     "• 'skip' to skip feedback\n"
+                     "Or refine your search (e.g., 'change genre to comedy', 'only Netflix')\n"
+                     "Type 'new' to start over or 'exit' to quit")
+            return True, next_q
+        
+        # Not feedback and not a question, turn off feedback mode
         self.waiting_for_feedback = False
         return False, None
     
@@ -1090,28 +1328,202 @@ class BotSession:
         
         return has_question_mark and starts_with_question and not contains_search_params
     
+    def _is_show_question(self, user_input: str) -> bool:
+        """
+        Check if the user is asking about a specific TV show.
+        e.g., "what about the expanse?", "is breaking bad available?", "tell me about stranger things"
+        """
+        user_lower = user_input.lower().strip()
+        
+        # Patterns for asking about specific shows
+        show_question_patterns = [
+            r'\bwhat about\b',                    # "what about the expanse?"
+            r'\bhow about\b',                     # "how about breaking bad?"
+            r'\btell me about\b',                 # "tell me about stranger things"
+            r'\bis\s+\w+.*\bavailable\b',         # "is the expanse available?"
+            r'\bdo you have\s+\w+',               # "do you have game of thrones?"
+            r'\bcan (i|you) find\s+\w+',          # "can you find dark?"
+            r'\bwhy (not|isn\'t)\s+\w+',          # "why not the expanse?"
+            r'\bwhere (is|can i watch)\s+\w+',    # "where can i watch the expanse?"
+            r'\bhave you heard of\b',             # "have you heard of The Expanse?"
+            r'\bdo you know\s+\w+',               # "do you know Breaking Bad?"
+            r'\bwhat do you think of\b',          # "what do you think of Stranger Things?"
+            r'\binfo (on|about)\b',               # "info on The Expanse"
+            r'\bdetails (on|about)\b',            # "details about Breaking Bad"
+        ]
+        
+        for pattern in show_question_patterns:
+            if re.search(pattern, user_lower):
+                return True
+        
+        return False
+    
+    def _extract_show_name(self, user_input: str) -> Optional[str]:
+        """
+        Extract the show name from a question about a specific show.
+        e.g., "what about The Expanse?" -> "The Expanse"
+        """
+        user_input = user_input.strip()
+        
+        # Remove trailing punctuation
+        user_input = re.sub(r'[?!.]+$', '', user_input).strip()
+        
+        # Patterns to extract show name
+        patterns = [
+            r'what about\s+(.+)',
+            r'how about\s+(.+)',
+            r'tell me about\s+(.+)',
+            r'is\s+(.+?)\s+available',
+            r'do you have\s+(.+)',
+            r'can (?:i|you) find\s+(.+)',
+            r'why (?:not|isn\'t)\s+(.+)',
+            r'where (?:is|can i watch)\s+(.+)',
+            r'have you heard of\s+(.+)',
+            r'do you know\s+(.+)',
+            r'what do you think of\s+(.+)',
+            r'info (?:on|about)\s+(.+)',
+            r'details (?:on|about)\s+(.+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, user_input, re.IGNORECASE)
+            if match:
+                show_name = match.group(1).strip()
+                # Clean up common trailing words
+                show_name = re.sub(r'\s+(show|series|tv show)$', '', show_name, flags=re.IGNORECASE)
+                return show_name
+        
+        return None
+    
+    def answer_show_question(self, user_input: str) -> bool:
+        """
+        Answer a question about a specific TV show using TMDB.
+        Returns True if handled, False otherwise.
+        """
+        show_name = self._extract_show_name(user_input)
+        
+        if not show_name:
+            logger.warning(f"Could not extract show name from: {user_input}")
+            return False
+        
+        logger.info(f"Answering question about show: {show_name}")
+        
+        # Get user's country (use cached or fetch)
+        if self.geo_cache is None:
+            try:
+                geo_res = ipinfo_location.invoke({})
+                geo_data = json.loads(geo_res)
+                self.geo_cache = geo_data
+            except Exception as e:
+                logger.error(f"Failed to get location: {e}")
+                self.geo_cache = {"country": "US"}
+        
+        country = (self.geo_cache or {}).get("country", "US")
+        
+        try:
+            # Call the tool
+            show_info_json = get_show_info.invoke({
+                "show_name": show_name,
+                "country": country,
+                "providers_text": self.prefs.providers
+            })
+            
+            show_info = json.loads(show_info_json)
+            
+            # Check for errors
+            if "error" in show_info:
+                print(f"ai> {show_info['error']}")
+                if "suggestion" in show_info:
+                    print(f"    {show_info['suggestion']}")
+                print()
+                return True
+            
+            # Format and display the information
+            print(f"\nai> Here's what I found about **{show_info.get('title', show_name)}**:\n")
+            
+            # Overview
+            overview = show_info.get('overview')
+            if overview:
+                wrapped = textwrap.fill(overview, width=80, initial_indent='    ', subsequent_indent='    ')
+                print(wrapped)
+                print()
+            
+            # Basic info
+            print(f"    📅 First aired: {show_info.get('first_air_date', 'N/A')}")
+            print(f"    📺 Status: {show_info.get('status', 'N/A')}")
+            
+            seasons = show_info.get('number_of_seasons')
+            episodes = show_info.get('number_of_episodes')
+            if seasons and episodes:
+                print(f"    🎬 {seasons} season{'s' if seasons > 1 else ''}, {episodes} episodes")
+            
+            # Genres
+            genres = show_info.get('genres', [])
+            if genres:
+                print(f"    🎭 Genres: {', '.join(genres)}")
+            
+            # Runtime
+            runtime = show_info.get('episode_runtime', [])
+            if runtime:
+                avg_runtime = sum(runtime) / len(runtime)
+                print(f"    ⏱️  Episode length: ~{int(avg_runtime)} min")
+            
+            # Rating
+            vote = show_info.get('vote_average')
+            if vote:
+                print(f"    ⭐ Rating: {vote:.1f}/10")
+            
+            # Availability
+            providers = show_info.get('available_on', [])
+            if providers:
+                print(f"    📡 Available on: {', '.join(providers[:5])}")
+                
+                # Check if user has access
+                if show_info.get('user_has_access'):
+                    print(f"    ✅ Good news! It's available on your platform{'s' if self.prefs.providers and ',' in self.prefs.providers else ''}!")
+                elif self.prefs.providers:
+                    print(f"    ⚠️  Note: Not currently available on {self.prefs.providers}")
+            else:
+                print(f"    ⚠️  Not available for streaming in {country}")
+            
+            print()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to get show info: {e}", exc_info=True)
+            print(f"ai> I'm having trouble getting information about that show right now.\n")
+            return True
+    
     def answer_informational_question(self, user_input: str) -> bool:
         """
         Answer an informational question.
         Returns True if handled, False otherwise.
         """
         logger.info(f"Detected informational question: {user_input}")
+        
+        # Check if it's a question about a specific show
+        if self._is_show_question(user_input):
+            return self.answer_show_question(user_input)
+        
+        # Otherwise, answer as a general informational question
         try:
             question_prompt = ChatPromptTemplate.from_messages([
                 ("system", 
                  "You are a helpful TV concierge assistant. Answer the user's question clearly and concisely. "
                  "Be friendly and informative. Keep your answer to 2-3 sentences.\n\n"
-                 "CRITICAL: Only provide information about the system capabilities and supported options listed below. "
-                 "DO NOT suggest specific TV series or make recommendations from your general knowledge. "
-                 "If asked about specific series availability, tell the user to provide their preferences so you can search.\n\n"
-                 "Context about what we're doing:\n"
-                 f"- We're helping find TV series recommendations\n"
-                 f"- Current preferences collected: genre={self.prefs.genre}, mood={self.prefs.mood}, duration={self.prefs.duration}, providers={self.prefs.providers}, language={self.prefs.language}\n"
+                 "CONTEXT:\n"
+                 f"- Current preferences: genre={self.prefs.genre}, mood={self.prefs.mood}, duration={self.prefs.duration}, providers={self.prefs.providers}, language={self.prefs.language}\n"
                  f"- Supported platforms: Netflix, Prime Video, Disney+, Apple TV+, HBO Max, Hulu, and many others\n"
                  f"- Supported genres: {', '.join(sorted(get_allowed_genres()))}\n"
                  f"- Supported moods: {', '.join(sorted(ALLOWED_MOOD))}\n"
                  f"- Duration options: <30m (short episodes), ~45m (standard), >60m (long episodes)\n"
-                 f"- Languages: {', '.join(sorted(ALLOWED_LANG))}"
+                 f"- Languages: {', '.join(sorted(ALLOWED_LANG))}\n\n"
+                 "INSTRUCTIONS:\n"
+                 "1. If asked about system capabilities:\n"
+                 "   - Provide information about supported options\n"
+                 "2. DO NOT make new recommendations unless the user explicitly asks to search again\n"
+                 "3. Stay helpful and conversational"
                 ),
                 ("human", "{question}")
             ])
