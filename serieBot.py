@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 SerieBot — Flexible slot filling → geo (ipinfo) → TMDB by Country → 3 reasoned suggestions.
-LangChain Innovations:
+LangChain 1.0 Innovations:
 - LCEL pipeline (ChatPromptTemplate | llm | parser)
 - Structured output with Pydantic for slot-filling
+- Streaming responses for better UX
+- LangGraph for conversation state management
 - Tool binding native (bind_tools) for ipinfo / TMDB
 - Dynamic provider selection by region (TMDB watch providers)
 Author: MojaLab
-Improvements: Enhanced validation, error handling, caching, and UX
+Improvements: Enhanced validation, error handling, caching, streaming, and UX
 """
 import os
 import re
@@ -19,7 +21,7 @@ import requests
 import logging
 import csv
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TypedDict, Annotated, Literal
 from pydantic import BaseModel, Field, field_validator
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
@@ -27,6 +29,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableSequence
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 
 # Load environment variables from .env file
 try:
@@ -216,6 +220,32 @@ class Suggestions(BaseModel):
     country: str
     suggestions: List[Dict] = Field(default_factory=list)
     note: Optional[str] = None
+
+# =========================
+# LangGraph State Definition
+# =========================
+class ConversationState(TypedDict):
+    """State for LangGraph conversation flow."""
+    # User preferences being collected
+    prefs: UserPrefs
+    
+    # Conversation metadata
+    session_id: str
+    user_input: str
+    next_question: Optional[str]
+    
+    # Geolocation cache
+    geo_cache: Optional[Dict]
+    
+    # Suggestions tracking
+    last_suggestions_count: int
+    
+    # Flow control
+    waiting_for_feedback: bool
+    prefs_complete: bool
+    
+    # Current state
+    current_state: Literal["greeting", "collecting", "searching", "feedback", "end"]
 
 # =========================
 # Validation
@@ -695,6 +725,15 @@ def normalize_user_input(user_input: str) -> str:
     """Normalize user input to help the LLM understand duration and other values."""
     text = user_input.strip()
     
+    # Handle negative responses for language/preferences ("no", "nope", "don't care", etc.)
+    # When user says these in isolation, treat as "any language" (most common missing field)
+    if re.match(r'^(no|nope|nah|don\'t care|doesn\'t matter|whatever|surprise me)$', text, re.IGNORECASE):
+        text = "any language"
+    
+    # Handle explicit "any" -> "any language" (before other "any" replacements)
+    if text.lower() == "any":
+        text = "any language"
+    
     # Normalize duration patterns (avoid double replacement)
     # First handle "X minutes" or "X min"
     text = re.sub(r'(?<![~<>])(\d{2,3})\s*min(utes?)?\b', r'~\1m', text, flags=re.IGNORECASE)
@@ -713,16 +752,15 @@ def normalize_user_input(user_input: str) -> str:
     if re.search(r'\b(standard|medium)\b', text, re.IGNORECASE):
         text = re.sub(r'\b(standard|medium)\b', '~45m', text, flags=re.IGNORECASE)
     
-    # Handle "any" for duration/language
+    # Handle "any duration" -> "~45m" (after handling "any" alone)
     text = re.sub(r'\bany duration\b', '~45m', text, flags=re.IGNORECASE)
-    text = re.sub(r'\bany language\b', 'any', text, flags=re.IGNORECASE)
     
     return text
 
 def merge_prefs(base: UserPrefs, new: UserPrefs) -> UserPrefs:
     """Merges new preferences into the base, overwriting existing values."""
-    data = base.dict()
-    for k, v in new.dict().items():
+    data = base.model_dump()
+    for k, v in new.model_dump().items():
         if v is not None:
             data[k] = v
     return UserPrefs(**data)
@@ -742,6 +780,66 @@ class ParseError(Exception):
 class APIError(Exception):
     """External API (TMDB, ipinfo) failed."""
     pass
+
+# =========================
+# LangGraph Node Functions
+# =========================
+def should_search(state: ConversationState) -> Literal["search", "collect", "end"]:
+    """Router: decide if we should search or keep collecting."""
+    user_input = state["user_input"].lower().strip()
+    
+    # Check for exit commands
+    if user_input in {"exit", "quit", "bye", "goodbye"}:
+        return "end"
+    
+    # Check if preferences are complete or user wants to search
+    if state["prefs_complete"] or user_input == "search":
+        return "search"
+    
+    return "collect"
+
+def should_continue(state: ConversationState) -> Literal["feedback", "collect", "end"]:
+    """Router: after search, go to feedback or continue."""
+    user_input = state["user_input"].lower().strip()
+    
+    if user_input in {"exit", "quit", "bye", "goodbye"}:
+        return "end"
+    
+    if state["waiting_for_feedback"]:
+        return "feedback"
+    
+    return "collect"
+
+def greeting_node(state: ConversationState) -> ConversationState:
+    """Initial greeting node."""
+    state["next_question"] = (
+        "Hi! 👋 What kind of TV series are you looking for?\n"
+        "(Tell me about genre, mood, duration, platforms, or language)"
+    )
+    state["current_state"] = "collecting"
+    return state
+
+def collecting_node(state: ConversationState) -> ConversationState:
+    """Node for collecting user preferences."""
+    logger.info("Collecting preferences node activated")
+    # This will be handled by BotSession.extract_preferences()
+    state["current_state"] = "collecting"
+    return state
+
+def searching_node(state: ConversationState) -> ConversationState:
+    """Node for performing TMDB search."""
+    logger.info("Searching node activated")
+    # This will be handled by BotSession.suggest_series()
+    state["current_state"] = "searching"
+    state["waiting_for_feedback"] = True
+    return state
+
+def feedback_node(state: ConversationState) -> ConversationState:
+    """Node for handling feedback."""
+    logger.info("Feedback node activated")
+    # This will be handled by BotSession.handle_feedback()
+    state["current_state"] = "feedback"
+    return state
 
 # =========================
 # Bot Session Class
@@ -848,6 +946,34 @@ class BotSession:
     
     def is_informational_question(self, user_input: str) -> bool:
         """Check if input is an informational question (not about search params)."""
+        user_lower = user_input.lower().strip()
+        
+        # Check for explicit list/options requests
+        list_request_patterns = [
+            r'\b(which|what)\s+(genre|mood|duration|language|provider|platform)s?\s+(can|should|do|are)',
+            r'\bgive\s+me\s+(the\s+)?(list|options)',
+            r'\bshow\s+me\s+(the\s+)?(list|options|choices)',
+            r'\bwhat\s+(are\s+)?(the\s+)?(available|possible|valid)',
+            r'\bi\s+need\s+(the\s+)?list',
+            r'\blist\s+of\s+(genre|mood|duration|language|provider)s?',
+        ]
+        
+        for pattern in list_request_patterns:
+            if re.search(pattern, user_lower):
+                return True
+        
+        # Check for generic greetings/small talk (questions without search params)
+        generic_question_patterns = [
+            r'\bhow\s+(are|is)\s+(you|it|things)',  # "how are you?", "how is it?"
+            r'\bwhat\'?s\s+up\b',                   # "what's up?"
+            r'\bhow\'?s\s+(it\s+)?going\b',         # "how's going?", "how's it going?"
+        ]
+        
+        for pattern in generic_question_patterns:
+            if re.search(pattern, user_lower):
+                return True
+        
+        # Original logic for other informational questions
         has_question_mark = user_input.strip().endswith("?")
         starts_with_question = any(user_input.lower().startswith(q) for q in self.informational_questions)
         contains_search_params = any(keyword in user_input.lower() for keyword in self.search_keywords)
@@ -881,11 +1007,19 @@ class BotSession:
             ])
             
             answer_chain = question_prompt | llm_base
-            response = answer_chain.invoke({"question": user_input})
-            answer_text = response.content if hasattr(response, 'content') else str(response)
-            logger.debug(f"Answer to question: {answer_text}")
             
-            print(f"ai> {answer_text}\n")
+            # Stream the response token by token
+            print("ai> ", end="", flush=True)
+            answer_text = ""
+            for chunk in answer_chain.stream({"question": user_input}):
+                if hasattr(chunk, 'content'):
+                    content = chunk.content
+                    if isinstance(content, str):
+                        answer_text += content
+                        print(content, end="", flush=True)
+            print("\n")
+            
+            logger.debug(f"Answer to question: {answer_text}")
             return True
             
         except Exception as e:
@@ -982,16 +1116,24 @@ class BotSession:
             response_language = "Italian" if self.prefs.language == "it" else "English"
             logger.info(f"Generating final response in {response_language}")
             
-            final = final_chain.invoke({
-                "prefs": json.dumps(self.prefs.dict(), ensure_ascii=False),
+            # Stream the final response token by token
+            print("\nai> ", end="", flush=True)
+            final_text = ""
+            for chunk in final_chain.stream({
+                "prefs": json.dumps(self.prefs.model_dump(), ensure_ascii=False),
                 "suggestions": json.dumps(suggestions_data, ensure_ascii=False),
                 "geo": json.dumps(self.geo_cache, ensure_ascii=False),
                 "language": response_language
-            })
+            }):
+                if hasattr(chunk, 'content'):
+                    content = chunk.content
+                    if isinstance(content, str):
+                        final_text += content
+                        print(content, end="", flush=True)
+            print("\n")
             
             logger.info("Successfully generated response")
-            logger.debug(f"Response length: {len(final.content)} chars")
-            print(f"\nai> {final.content}\n")
+            logger.debug(f"Response length: {len(final_text)} chars")
             
             self.last_suggestions_count = len(suggestions_data.get("suggestions", []))
             return True
@@ -1099,7 +1241,7 @@ class BotSession:
                     print(f"   ⏱️  Duration options: <30m (short), ~45m (standard), >60m (long)")
                     print()
                 else:
-                    missing = [k for k,v in self.prefs.dict().items() if v is None]
+                    missing = [k for k,v in self.prefs.model_dump().items() if v is None]
                     if missing:
                         logger.debug(f"Still missing: {missing}")
                         if 'duration' in missing and self.repeat_count > 0:
@@ -1119,6 +1261,75 @@ class BotSession:
                            "Type 'new' to start over or 'exit' to quit")
             else:
                 ask_next = "What would you like to search for?"
+
+def build_conversation_graph():
+    """
+    Build the LangGraph conversation flow.
+    
+    States:
+    - greeting: Initial welcome
+    - collecting: Collecting user preferences
+    - searching: Performing TMDB search
+    - feedback: Collecting user feedback
+    - end: Termination
+    """
+    logger.info("Building LangGraph conversation flow")
+    
+    # Create the graph
+    workflow = StateGraph(ConversationState)
+    
+    # Add nodes
+    workflow.add_node("greeting", greeting_node)
+    workflow.add_node("collecting", collecting_node)
+    workflow.add_node("searching", searching_node)
+    workflow.add_node("feedback", feedback_node)
+    
+    # Add edges from START
+    workflow.add_edge(START, "greeting")
+    
+    # Add conditional edges
+    workflow.add_conditional_edges(
+        "greeting",
+        lambda state: "collecting",
+        {"collecting": "collecting"}
+    )
+    
+    workflow.add_conditional_edges(
+        "collecting",
+        should_search,
+        {
+            "search": "searching",
+            "collect": "collecting",
+            "end": END
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "searching",
+        should_continue,
+        {
+            "feedback": "feedback",
+            "collect": "collecting",
+            "end": END
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "feedback",
+        should_continue,
+        {
+            "feedback": "feedback",
+            "collect": "collecting",
+            "end": END
+        }
+    )
+    
+    # Compile the graph with memory
+    memory = MemorySaver()
+    app = workflow.compile(checkpointer=memory)
+    
+    logger.info("LangGraph conversation flow built successfully")
+    return app
 
 def run_cli():
     """Main entry point for the CLI application."""

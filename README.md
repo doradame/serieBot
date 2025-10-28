@@ -1,29 +1,68 @@
 # 🍿 SerieBot — Intelligent TV Series Recommendation System
 
-A sophisticated TV series recommendation chatbot that combines **LangChain**, **OVH AI Endpoints**, **TMDB API**, and **geolocation** to provide personalized, context-aware suggestions based on your preferences and streaming service availability in your region.
+A sophisticated TV series recommendation chatbot powered by **LangChain 1.0**, **LangGraph**, **OVH AI Endpoints**, **TMDB API**, and **geolocation** to provide personalized, context-aware suggestions with streaming responses and intelligent state management.
 
 ## 🌟 Key Features
 
+### Core Functionality
 - **Natural Conversation Flow**: Engages users in a friendly dialogue to understand their preferences
 - **Intelligent Genre Matching**: Advanced scoring system that prioritizes content most relevant to user requests
 - **Freshness Bonus**: Promotes newer series to diversify suggestions and avoid repetitive recommendations
 - **Geographic Awareness**: Automatically detects your location and filters by available streaming providers
 - **Multi-platform Support**: Works with Netflix, Prime Video, Disney+, Apple TV+, HBO Max, and many others
 - **Feedback System**: Collects user ratings to improve future recommendations
+
+### LangChain 1.0 Innovations ✨
+- **Streaming Responses**: Real-time token-by-token response generation for better UX
+- **LangGraph State Management**: Structured conversation flow with automatic state transitions
+- **Memory Checkpointing**: Persistent conversation state with rollback capability
+- **Modular Architecture**: Clean separation of concerns with testable components
 - **Comprehensive Logging**: Detailed logging for debugging and monitoring
-- **State Management**: Maintains conversation context across multiple turns
 
 ---
 
 ## 🏗️ Architecture Overview
 
-SerieBot leverages **LangChain** to build a robust, maintainable, and scalable AI application. Here's how LangChain transforms what could be a messy collection of API calls into an elegant orchestration system:
+SerieBot leverages **LangChain 1.0** and **LangGraph** to build a robust, maintainable, and scalable AI application. Here's how modern LangChain features transform the conversation experience:
 
-### 1. Orchestrating the Logic (LCEL) 🔗
+### 1. LangGraph Conversation Flow 🗺️
 
-The most important concept in this project is the **LangChain Expression Language (LCEL)**. This is what allows you to create powerful chains of operations using the `|` (pipe) symbol.
+The bot uses **LangGraph** to manage conversation states with clear transitions:
 
-The bot has two key chains:
+```
+START → greeting → collecting ⇄ searching → feedback → END
+                      ↓
+                    exit
+```
+
+**States:**
+- `greeting`: Welcome message and initial setup
+- `collecting`: Gathering user preferences (genre, mood, duration, platforms, language)
+- `searching`: Executing TMDB search with geo-filtering
+- `feedback`: Collecting user feedback (👍/👎)
+- `end`: Graceful termination
+
+**Benefits:**
+- 🧩 Modular design - each state is isolated and testable
+- 🔄 Easy to extend - add new conversation paths without breaking existing logic
+- 💾 Automatic checkpointing - conversation state persists across sessions
+- 📊 Visual debugging - graph structure is self-documenting
+
+### 2. Streaming Responses 🌊
+
+All LLM responses now stream token-by-token for better user experience:
+
+```python
+# Streaming implementation
+for chunk in chain.stream(input):
+    print(chunk.content, end="", flush=True)
+```
+
+Users see the bot "thinking" in real-time, creating a more interactive experience.
+
+### 3. Orchestrating the Logic (LCEL) 🔗
+
+The bot uses **LangChain Expression Language (LCEL)** to create powerful chains using the `|` (pipe) symbol.
 
 #### **Preference Extraction Chain**
 This pipeline takes the user's input, processes it through a ChatPromptTemplate, sends it to the LLM, and then forces the model's text answer into a structured `CollectResult` object using the `PydanticOutputParser`.
