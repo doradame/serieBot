@@ -1,0 +1,26 @@
+# SerieBot Dependencies
+# Core LangChain components
+langchain-openai==0.1.23
+langchain-core==0.2.38
+langchain==0.2.16
+
+# Data validation and parsing
+pydantic==2.8.2
+
+# HTTP requests and API interactions
+requests==2.31.0
+
+# Environment variables management
+python-dotenv==1.0.1
+
+# Optional: Enhanced CLI experience
+rich==13.7.1
+
+# Optional: Async HTTP for better performance
+aiohttp==3.9.5
+
+# Development dependencies (optional)
+# pytest==8.3.2
+# pytest-asyncio==0.23.8
+# black==24.8.0
+# flake8==7.1.1
