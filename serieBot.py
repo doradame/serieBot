@@ -266,6 +266,134 @@ def normalize_providers_llm(user_text: str) -> List[str]:
         logger.error(f"Failed to normalize providers with LLM: {e}")
         return []
 
+def validate_mood_llm(user_mood: str) -> Optional[str]:
+    """
+    Use LLM to intelligently map user's mood description to canonical mood.
+    Handles synonyms, similar concepts, and informal descriptions.
+    """
+    if not user_mood:
+        return None
+    
+    mood_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a mood classifier for TV series recommendations. Your job is to map user's mood "
+         "descriptions to one of the canonical mood categories.\n\n"
+         "CANONICAL MOODS:\n"
+         f"{', '.join(sorted(ALLOWED_MOOD))}\n\n"
+         "MOOD DESCRIPTIONS:\n"
+         "- light-hearted: fun, funny, cheerful, uplifting, comedy, humorous, lighthearted\n"
+         "- intense: serious, dark, heavy, dramatic, gripping, suspenseful\n"
+         "- mind-blowing: mind blowing, thought-provoking, complex, philosophical, cerebral, intelligent\n"
+         "- comforting: cozy, feel-good, relaxing, wholesome, heartwarming, warm\n"
+         "- adrenaline-fueled: action-packed, thrilling, exciting, fast-paced, edge-of-your-seat\n\n"
+         "INSTRUCTIONS:\n"
+         "1. Analyze the user's mood description\n"
+         "2. Map it to the MOST SIMILAR canonical mood from the list above\n"
+         "3. If the description doesn't clearly match any mood, return null\n"
+         "4. Return ONLY the exact canonical mood name or null\n\n"
+         "RESPONSE FORMAT (valid JSON string only):\n"
+         '"canonical-mood" or null\n\n'
+         "EXAMPLES:\n"
+         "Input: 'relaxing' → \"comforting\"\n"
+         "Input: 'funny' → \"light-hearted\"\n"
+         "Input: 'action packed' → \"adrenaline-fueled\"\n"
+         "Input: 'deep and complex' → \"mind-blowing\"\n"
+         "Input: 'dark and gritty' → \"intense\"\n"
+         "Input: 'pizza' → null\n"
+        ),
+        ("human", "{user_mood}")
+    ])
+    
+    try:
+        mood_chain = mood_prompt | llm_base
+        response = mood_chain.invoke({"user_mood": user_mood})
+        
+        # Extract content
+        content = response.content if hasattr(response, 'content') else str(response)
+        logger.debug(f"LLM mood response: {content}")
+        
+        # Parse JSON - ensure content is a string
+        content_str = content if isinstance(content, str) else str(content)
+        mood = json.loads(content_str.strip())
+        
+        # Validate that returned mood is in canonical list
+        if mood and mood in ALLOWED_MOOD:
+            logger.info(f"LLM mapped mood: '{user_mood}' -> '{mood}'")
+            return mood
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Failed to validate mood with LLM: {e}")
+        return None
+
+def validate_genre_llm(user_genres: List[str]) -> List[str]:
+    """
+    Use LLM to intelligently map user's genre descriptions to canonical genres.
+    Handles synonyms, typos, and related concepts.
+    """
+    if not user_genres:
+        return []
+    
+    # Get allowed genres from TMDB
+    allowed_genres = get_allowed_genres()
+    
+    genre_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a genre classifier for TV series. Your job is to map user's genre descriptions "
+         "to canonical TMDB genre categories.\n\n"
+         "CANONICAL GENRES:\n"
+         f"{', '.join(sorted(allowed_genres))}\n\n"
+         "COMMON MAPPINGS:\n"
+         "- 'horror' → ['mystery', 'thriller'] (horror is a movie genre, closest TV equivalents)\n"
+         "- 'thriller' → ['mystery', 'crime']\n"
+         "- 'romantic' → ['drama']\n"
+         "- 'sitcom' → ['comedy']\n"
+         "- 'space' → ['sci-fi']\n"
+         "- 'supernatural' → ['sci-fi & fantasy', 'mystery']\n"
+         "- 'true crime' → ['crime', 'documentary']\n\n"
+         "INSTRUCTIONS:\n"
+         "1. Map each user genre to ONE OR MORE canonical genres\n"
+         "2. Handle typos (e.g., 'sifi' → 'sci-fi')\n"
+         "3. Handle synonyms (e.g., 'funny' → 'comedy')\n"
+         "4. Return ONLY canonical genres from the list above\n"
+         "5. If a genre has no clear mapping, exclude it\n\n"
+         "RESPONSE FORMAT (valid JSON array only):\n"
+         '["genre1", "genre2"]\n\n'
+         "EXAMPLES:\n"
+         "Input: ['horror', 'suspense'] → [\"mystery\", \"crime\"]\n"
+         "Input: ['funny'] → [\"comedy\"]\n"
+         "Input: ['space opera'] → [\"sci-fi\", \"action & adventure\"]\n"
+         "Input: ['sifi'] → [\"sci-fi\"]\n"
+         "Input: ['romantic drama'] → [\"drama\"]\n"
+        ),
+        ("human", "{user_genres}")
+    ])
+    
+    try:
+        genre_chain = genre_prompt | llm_base
+        response = genre_chain.invoke({"user_genres": json.dumps(user_genres)})
+        
+        # Extract content
+        content = response.content if hasattr(response, 'content') else str(response)
+        logger.debug(f"LLM genre response: {content}")
+        
+        # Parse JSON - ensure content is a string
+        content_str = content if isinstance(content, str) else str(content)
+        genres = json.loads(content_str.strip())
+        
+        # Validate that all returned genres are in canonical list
+        valid_genres = [g.lower() for g in genres if g.lower() in allowed_genres]
+        
+        if valid_genres:
+            logger.info(f"LLM mapped genres: {user_genres} -> {valid_genres}")
+        
+        return valid_genres
+        
+    except Exception as e:
+        logger.error(f"Failed to validate genres with LLM: {e}")
+        return []
+
 # =========================
 # Pydantic models (typed I/O)
 # =========================
@@ -356,29 +484,67 @@ class ConversationState(TypedDict):
 # =========================
 # Validation
 # =========================
-def validate_prefs(prefs: UserPrefs) -> UserPrefs:
-    """Post-process to ensure only valid values make it through."""
+def validate_prefs(prefs: UserPrefs) -> Tuple[UserPrefs, Dict]:
+    """
+    Post-process to ensure only valid values make it through.
+    Returns (validated_prefs, mapping_info) where mapping_info contains
+    any LLM mappings that were performed.
+    """
     validated_data = {}
+    mapping_info = {}
     
-    # Validate genres - use dynamic list from TMDB
+    # Validate genres - try exact match first, then LLM for fuzzy matching
     if prefs.genre:
         allowed_genres = get_allowed_genres()
         validated_genres = []
+        unmatched_genres = []
+        
         for genre in prefs.genre:
             genre_lower = genre.lower()
             if genre_lower in allowed_genres:
                 validated_genres.append(genre_lower)
+            else:
+                unmatched_genres.append(genre)
+        
+        # Try LLM for unmatched genres
+        if unmatched_genres:
+            try:
+                llm_genres = validate_genre_llm(unmatched_genres)
+                if llm_genres:
+                    validated_genres.extend(llm_genres)
+                    # Store mapping info for user feedback
+                    mapping_info['genre'] = {
+                        'original': unmatched_genres,
+                        'mapped': llm_genres
+                    }
+            except Exception as e:
+                logger.warning(f"LLM genre validation failed: {e}")
+        
         validated_data['genre'] = validated_genres if validated_genres else None
     else:
         validated_data['genre'] = None
     
-    # Validate mood
+    # Validate mood - try LLM first, fallback to exact match
     if prefs.mood:
         mood_lower = prefs.mood.lower()
         if mood_lower in ALLOWED_MOOD:
             validated_data['mood'] = mood_lower
         else:
-            validated_data['mood'] = None
+            # Try LLM to map similar moods
+            try:
+                llm_mood = validate_mood_llm(prefs.mood)
+                if llm_mood:
+                    validated_data['mood'] = llm_mood
+                    # Store mapping info for user feedback
+                    mapping_info['mood'] = {
+                        'original': prefs.mood,
+                        'mapped': llm_mood
+                    }
+                else:
+                    validated_data['mood'] = None
+            except Exception as e:
+                logger.warning(f"LLM mood validation failed: {e}")
+                validated_data['mood'] = None
     else:
         validated_data['mood'] = None
     
@@ -395,7 +561,7 @@ def validate_prefs(prefs: UserPrefs) -> UserPrefs:
     # Providers - just pass through (will be normalized later)
     validated_data['providers'] = prefs.providers
     
-    return UserPrefs(**validated_data)
+    return (UserPrefs(**validated_data), mapping_info)
 
 # =========================
 # Tools (ipinfo + TMDB)
@@ -1177,7 +1343,12 @@ def suggest_series(genre: Optional[str], mood: str, duration: Optional[str],
     logger.info(f"Returning {len(suggestions)} suggestions")
     
     if not suggestions:
-        msg = "No titles available on the specified providers." if owned_ids else "No suitable titles found."
+        if owned_ids:
+            msg = (f"No titles available on the specified providers. "
+                   f"💡 Try removing the provider filter or selecting different genres/moods.")
+        else:
+            msg = (f"No suitable titles found. "
+                   f"💡 Try different genres, moods, or broadening your language preference.")
         logger.warning(f"No suggestions found: {msg}")
         return json.dumps({"country": region, "suggestions": [], "note": msg}, ensure_ascii=False)
     
@@ -1316,10 +1487,10 @@ collect_prompt = ChatPromptTemplate.from_messages([
      "HOW TO INTERACT:\n"
      "1. **Extract everything** from the user's message in one go - read carefully!\n"
      "2. **Multiple genres are OK** - If user says 'sci-fi and mystery' or 'comedy, drama', extract as a comma-separated list\n"
-     "3. **Keep what you know** - Don't change fields that are already filled unless the user explicitly wants to change them.\n"
-     "4. **Be natural** - If something's missing, ask ONE simple question. Be conversational, friendly, and brief (1-2 sentences max).\n"
-     "5. **Don't repeat yourself** - NEVER ask about information you already have (check WHAT YOU ALREADY KNOW above).\n"
-     "6. **Validate gently** - If the user says something close but not quite right (like 'action' when 'crime' exists), suggest the valid option naturally.\n"
+     "3. **Be permissive with genres** - Extract ANY genre-related words (even if not in the list above). The system will map them intelligently (e.g., 'horror' → 'mystery, thriller')\n"
+     "4. **Keep what you know** - Don't change fields that are already filled unless the user explicitly wants to change them.\n"
+     "5. **Be natural** - If something's missing, ask ONE simple question. Be conversational, friendly, and brief (1-2 sentences max).\n"
+     "6. **Don't repeat yourself** - NEVER ask about information you already have (check WHAT YOU ALREADY KNOW above).\n"
      "7. **Know when you're done** - Once you have all 4 required fields (genre, mood, providers, language), set ask_next to null.\n\n"
      
      "EXAMPLES OF NATURAL QUESTIONS (do NOT list options!):\n"
@@ -1384,6 +1555,10 @@ def normalize_user_input(user_input: str) -> str:
     # Handle explicit "any" -> "any language" (before other "any" replacements)
     if text.lower() == "any":
         text = "any language"
+    
+    # Handle "any language" variations
+    if re.search(r'\b(any language|all languages|no language preference)\b', text, re.IGNORECASE):
+        text = re.sub(r'\b(any language|all languages|no language preference)\b', 'any', text, flags=re.IGNORECASE)
     
     # Normalize duration patterns (avoid double replacement)
     # First handle "X minutes" or "X min"
@@ -2000,8 +2175,6 @@ class BotSession:
             
             return is_off
             
-            return is_off
-            
         except Exception as e:
             logger.error(f"LLM off-topic detection failed: {e}")
             # Fallback to False (don't block if LLM fails)
@@ -2084,10 +2257,11 @@ class BotSession:
         
         return msg
     
-    def extract_preferences(self, user_input: str) -> Optional[str]:
+    def extract_preferences(self, user_input: str) -> Tuple[Optional[str], Dict]:
         """
         Extract preferences from user input.
-        Returns next question or None if extraction failed.
+        Returns (next_question, mapping_info) tuple.
+        mapping_info contains any LLM mappings done (genre/mood/provider).
         """
         try:
             logger.debug("Invoking slot extraction chain")
@@ -2110,7 +2284,7 @@ class BotSession:
             )
             
             collect: CollectResult = collect_chain.invoke({"user_input": normalized_input})
-            validated_prefs = validate_prefs(collect.known)
+            validated_prefs, mapping_info = validate_prefs(collect.known)
             logger.debug(f"Extracted preferences: {validated_prefs}")
             
             # Store old prefs to check if extraction made progress
@@ -2130,18 +2304,18 @@ class BotSession:
             if no_progress:
                 logger.warning(f"No progress after {self.repeat_count} attempts with input: {user_input}")
                 # Return contextual help
-                return "CONTEXTUAL_HELP"
+                return ("CONTEXTUAL_HELP", {})
             
             next_q = None if prefs_complete(self.prefs) else (collect.ask_next or "What other preference can you tell me?")
             
             logger.info(f"Current preferences: genre={self.prefs.genre}, mood={self.prefs.mood}, "
                        f"providers={self.prefs.providers}, language={self.prefs.language}")
-            return next_q
+            return (next_q, mapping_info)
             
         except Exception as e:
             logger.error(f"Failed to parse user input: {e}", exc_info=True)
             # Return contextual help instead of generic error
-            return "CONTEXTUAL_HELP"  # Return special marker for contextual help
+            return ("CONTEXTUAL_HELP", {})  # Return special marker for contextual help
     
     def perform_search(self) -> bool:
         """
@@ -2149,17 +2323,20 @@ class BotSession:
         Returns True if successful, False otherwise.
         """
         logger.info("Initiating search with complete preferences")
-        print("ai> Perfect! Let me find the best matches for you...\n")
+        print("ai> Perfect! Let me find the best matches for you... 🔍", flush=True)
         
         try:
             # Get location if not cached
             if self.geo_cache is None:
                 logger.info("Fetching geolocation")
+                print(" 📍 Detecting your location...", end="", flush=True)
                 geo_res = ipinfo_location.invoke({})
                 geo_data = json.loads(geo_res)
                 if "error" in geo_data:
                     logger.warning(f"Geolocation error: {geo_data['error']}")
-                    print(f"ai> Warning: {geo_data['error']}. Using default location (US).\n")
+                    print(f"\nai> Warning: {geo_data['error']}. Using default location (US).\n")
+                else:
+                    print(" ✓", flush=True)
                 self.geo_cache = geo_data
             
             country = (self.geo_cache or {}).get("country", "US")
@@ -2167,6 +2344,7 @@ class BotSession:
             
             # Get suggestions
             logger.info("Requesting series suggestions")
+            print(" 🎬 Searching TMDB database...", end="", flush=True)
             # Convert genre list to comma-separated string for the tool
             genre_str = ",".join(self.prefs.genre) if self.prefs.genre else None
             sugg_res = suggest_series.invoke({
@@ -2177,6 +2355,7 @@ class BotSession:
                 "language": self.prefs.language or "en",
                 "country": country
             })
+            print(" ✓", flush=True)
             suggestions_data = json.loads(sugg_res)
             
             # Check for errors
@@ -2249,6 +2428,17 @@ class BotSession:
                     help_msg = self.get_contextual_help_message()
                     print(f"\nai> I notice we're going in circles. Let me help! 🔄\n")
                     print(f"{help_msg}\n")
+                    
+                    # Show examples based on what's missing
+                    if not self.prefs.genre:
+                        print("   💡 Examples: sci-fi, comedy, drama, mystery, action & adventure\n")
+                    elif not self.prefs.mood:
+                        print("   💡 Examples: intense, light-hearted, mind-blowing, comforting\n")
+                    elif not self.prefs.providers:
+                        print("   💡 Examples: Netflix, Prime Video, Disney+, HBO Max\n")
+                    elif not self.prefs.language:
+                        print("   💡 Examples: English, Italian, any language\n")
+                    
                     self.repeat_count = 0
                     self.last_ask_next = None
                     continue
@@ -2322,7 +2512,7 @@ class BotSession:
                 # Store current preferences to detect what changed
                 prefs_before = self.prefs.model_dump()
                 
-                ask_next = self.extract_preferences(user_in)
+                ask_next, mapping_info = self.extract_preferences(user_in)
                 if ask_next == "CONTEXTUAL_HELP":
                     # Show contextual help instead of generic error
                     help_msg = self.get_contextual_help_message()
@@ -2330,6 +2520,21 @@ class BotSession:
                     # Reset ask_next to avoid showing the marker
                     ask_next = None
                     continue
+                
+                # Show mapping feedback to user
+                if mapping_info:
+                    if 'genre' in mapping_info:
+                        original = mapping_info['genre']['original']
+                        mapped = mapping_info['genre']['mapped']
+                        print(f"ai> 💡 I mapped '{', '.join(original)}' to '{', '.join(mapped)}' for you.\n")
+                    if 'mood' in mapping_info:
+                        original = mapping_info['mood']['original']
+                        mapped = mapping_info['mood']['mapped']
+                        print(f"ai> 💡 I understood '{original}' as '{mapped}'.\n")
+                    if 'provider' in mapping_info:
+                        original = mapping_info['provider']['original']
+                        mapped = mapping_info['provider']['mapped']
+                        print(f"ai> ✓ Found: {', '.join(mapped)} (from '{original}')\n")
                 
                 # Check if any preferences were actually extracted and what changed
                 prefs_after = self.prefs.model_dump()
