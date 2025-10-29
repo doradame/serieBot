@@ -548,13 +548,29 @@ def validate_prefs(prefs: UserPrefs) -> Tuple[UserPrefs, Dict]:
     else:
         validated_data['mood'] = None
     
-    # Validate language
+    # Validate language - with smart mapping
     if prefs.language:
-        lang_lower = prefs.language.lower()
+        lang_lower = prefs.language.lower().strip()
+        
+        # Direct match
         if lang_lower in ALLOWED_LANG:
             validated_data['language'] = lang_lower
         else:
-            validated_data['language'] = None
+            # Map common language names to codes
+            lang_map = {
+                'english': 'en',
+                'italian': 'it',
+                'italiano': 'it',
+                'inglese': 'en',
+                'any language': 'any',
+                'all languages': 'any',
+                'no preference': 'any'
+            }
+            
+            if lang_lower in lang_map:
+                validated_data['language'] = lang_map[lang_lower]
+            else:
+                validated_data['language'] = None
     else:
         validated_data['language'] = None
     
