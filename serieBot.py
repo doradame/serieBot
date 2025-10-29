@@ -22,6 +22,7 @@ import logging
 import csv
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, TypedDict, Annotated, Literal
+from urllib.parse import urlencode
 from pydantic import BaseModel, Field, field_validator
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
@@ -42,6 +43,9 @@ except ImportError:
 # =========================
 # Logging Configuration
 # =========================
+# Load DEBUG setting before setup_logging() is called
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
 def setup_logging():
     """Configure logging with both file and console handlers."""
     log_dir = "logs"
@@ -68,9 +72,9 @@ def setup_logging():
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
     
-    # Console handler - only warnings and errors
+    # Console handler - only errors (not warnings)
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
+    console_handler.setLevel(logging.ERROR)
     console_formatter = logging.Formatter('⚠️  %(levelname)s: %(message)s')
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
@@ -91,11 +95,10 @@ TMDB_KEY = os.getenv("TMDB_API_KEY")
 OVH_BASE = os.getenv("OPENAI_API_BASE", "https://api.ai.ovh.net/v1")
 OVH_KEY  = os.getenv("OPENAI_API_KEY")
 MODEL    = os.getenv("OVH_MODEL") or None  # None allows the API to use its default model
-DEBUG    = os.getenv("DEBUG", "false").lower() == "true"
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "en")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
-# Initialize logging
+# Initialize logging (DEBUG already defined above)
 logger = setup_logging()
 logger.info(f"Configuration loaded - TMDB: {'✓' if TMDB_KEY else '✗'}, OVH: {'✓' if OVH_KEY else '✗'}")
 logger.info(f"Model: {MODEL or 'gpt-oss-120b'}, Base URL: {OVH_BASE}")
@@ -132,13 +135,16 @@ def save_feedback(session_id: str, rating: str, prefs: 'UserPrefs',
                  country: str, suggestions_count: int, comment: str = ""):
     """Save user feedback to CSV file."""
     try:
+        # Convert genre list to comma-separated string for CSV
+        genre_str = ", ".join(prefs.genre) if prefs.genre else "N/A"
+        
         with open(FEEDBACK_FILE, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
                 datetime.now().isoformat(),
                 session_id,
                 rating,
-                prefs.genre or "N/A",
+                genre_str,
                 prefs.mood or "N/A",
                 prefs.duration or "N/A",
                 prefs.providers or "N/A",
@@ -175,9 +181,23 @@ PROVIDER_SYNONYMS = {
 }
 
 def normalize_providers(user_text: str) -> List[str]:
+    """
+    Normalize provider names using LLM for intelligent matching.
+    Falls back to regex-based matching if LLM fails.
+    """
     if not user_text:
         return []
-    # Accept comma/semicolon/"and"/multi-space separated inputs
+    
+    # Try LLM-based normalization first
+    try:
+        normalized = normalize_providers_llm(user_text)
+        if normalized:
+            logger.debug(f"LLM normalized providers: '{user_text}' -> {normalized}")
+            return normalized
+    except Exception as e:
+        logger.warning(f"LLM provider normalization failed: {e}, falling back to regex")
+    
+    # Fallback to regex-based matching
     tokens = [t.strip() for t in re.split(r"[,\;]| and |\s{2,}", user_text, flags=re.I) if t.strip()]
     out = set()
     for t in tokens:
@@ -185,7 +205,66 @@ def normalize_providers(user_text: str) -> List[str]:
         for canonical, syns in PROVIDER_SYNONYMS.items():
             if st == _slug(canonical) or st in [_slug(x) for x in syns]:
                 out.add(canonical)
-    return list(out)
+    result = list(out)
+    logger.debug(f"Regex normalized providers: '{user_text}' -> {result}")
+    return result
+
+def normalize_providers_llm(user_text: str) -> List[str]:
+    """
+    Use LLM to intelligently normalize provider names.
+    Handles typos, abbreviations, and informal names.
+    """
+    if not user_text:
+        return []
+    
+    # Get list of canonical provider names
+    canonical_providers = list(PROVIDER_SYNONYMS.keys())
+    
+    provider_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a streaming service name normalizer. Your job is to identify streaming service names "
+         "from user input and map them to their canonical names.\n\n"
+         "CANONICAL PROVIDER NAMES:\n"
+         f"{', '.join(canonical_providers)}\n\n"
+         "INSTRUCTIONS:\n"
+         "1. Extract all streaming service mentions from the user's text\n"
+         "2. Handle typos (e.g., 'Netfix' → 'Netflix', 'Primevideo' → 'Prime Video')\n"
+         "3. Handle abbreviations (e.g., 'D+' → 'Disney+', 'HBO' → 'HBO Max')\n"
+         "4. Handle informal names (e.g., 'Prime' → 'Prime Video', 'Disney' → 'Disney+')\n"
+         "5. Return ONLY the canonical names from the list above\n"
+         "6. If no valid providers found, return empty list\n\n"
+         "RESPONSE FORMAT (valid JSON array only):\n"
+         '["Provider1", "Provider2"]\n\n'
+         "EXAMPLES:\n"
+         "Input: 'netfix and hulu' → [\"Netflix\", \"Hulu\"]\n"
+         "Input: 'prime video' → [\"Prime Video\"]\n"
+         "Input: 'D+ and apple tv' → [\"Disney+\", \"Apple TV+\"]\n"
+         "Input: 'nflx' → [\"Netflix\"]\n"
+         "Input: 'no preference' → []\n"
+        ),
+        ("human", "{user_text}")
+    ])
+    
+    try:
+        provider_chain = provider_prompt | llm_base
+        response = provider_chain.invoke({"user_text": user_text})
+        
+        # Extract content
+        content = response.content if hasattr(response, 'content') else str(response)
+        logger.debug(f"LLM provider response: {content}")
+        
+        # Parse JSON - ensure content is a string
+        content_str = content if isinstance(content, str) else str(content)
+        providers = json.loads(content_str.strip())
+        
+        # Validate that all returned providers are in canonical list
+        valid_providers = [p for p in providers if p in canonical_providers]
+        
+        return valid_providers
+        
+    except Exception as e:
+        logger.error(f"Failed to normalize providers with LLM: {e}")
+        return []
 
 # =========================
 # Pydantic models (typed I/O)
@@ -210,11 +289,25 @@ def get_allowed_genres() -> set:
 
 class UserPrefs(BaseModel):
     """Holds all user preferences."""
-    genre: Optional[str] = None
+    genre: Optional[List[str]] = None  # Changed to list to support multiple genres
     mood: Optional[str] = None
     duration: Optional[str] = None
     providers: Optional[str] = None
     language: Optional[str] = None
+    
+    @field_validator('genre', mode='before')
+    @classmethod
+    def convert_genre_to_list(cls, v):
+        """Convert genre to list if it's a string, or ensure it's a list."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            # Split by comma or "and" to handle multiple genres
+            genres = re.split(r'[,&]|\s+and\s+', v, flags=re.IGNORECASE)
+            return [g.strip().lower() for g in genres if g.strip()]
+        if isinstance(v, list):
+            return [str(item).strip().lower() for item in v if str(item).strip()]
+        return None
     
     @field_validator('providers', mode='before')
     @classmethod
@@ -267,14 +360,15 @@ def validate_prefs(prefs: UserPrefs) -> UserPrefs:
     """Post-process to ensure only valid values make it through."""
     validated_data = {}
     
-    # Validate genre - use dynamic list from TMDB
+    # Validate genres - use dynamic list from TMDB
     if prefs.genre:
-        genre_lower = prefs.genre.lower()
         allowed_genres = get_allowed_genres()
-        if genre_lower in allowed_genres:
-            validated_data['genre'] = genre_lower
-        else:
-            validated_data['genre'] = None
+        validated_genres = []
+        for genre in prefs.genre:
+            genre_lower = genre.lower()
+            if genre_lower in allowed_genres:
+                validated_genres.append(genre_lower)
+        validated_data['genre'] = validated_genres if validated_genres else None
     else:
         validated_data['genre'] = None
     
@@ -287,16 +381,6 @@ def validate_prefs(prefs: UserPrefs) -> UserPrefs:
             validated_data['mood'] = None
     else:
         validated_data['mood'] = None
-    
-    # Validate duration
-    if prefs.duration:
-        duration_lower = prefs.duration.lower()
-        if duration_lower in ALLOWED_DURATION:
-            validated_data['duration'] = duration_lower
-        else:
-            validated_data['duration'] = None
-    else:
-        validated_data['duration'] = None
     
     # Validate language
     if prefs.language:
@@ -461,9 +545,25 @@ class TMDB:
         self._rate_limit()
         url = f"{self.BASE}/discover/tv"
         p = {"api_key": self.key, **{k:v for k,v in params.items() if v is not None}}
+        
+        # Log the full request URL (without API key for security)
+        debug_params = {k:v for k,v in p.items() if k != 'api_key'}
+        logger.debug(f"TMDB request URL: {url}?{urlencode(debug_params)}")
+        
         r = requests.get(url, params=p, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
-        return r.json().get("results", [])
+        
+        # Log the response for debugging
+        response_data = r.json()
+        results = response_data.get("results", [])
+        total_results = response_data.get("total_results", 0)
+        total_pages = response_data.get("total_pages", 0)
+        
+        logger.info(f"TMDB discover_tv response: {len(results)} results on page, total_results={total_results}, total_pages={total_pages}")
+        if DEBUG:
+            logger.debug(f"TMDB full response: {response_data}")
+        
+        return results
     
     def watch_providers_for(self, tv_id: int, region: str) -> List[str]:
         self._rate_limit()
@@ -521,6 +621,24 @@ def get_genre_id(genre_name: str) -> Optional[int]:
     genres = tmdb.get_tv_genres()
     return genres.get((genre_name or "").lower())
 
+def get_genre_ids(genre_names: Optional[List[str]]) -> Optional[str]:
+    """
+    Get comma-separated TMDB genre IDs from list of genre names.
+    Returns None if no genres found or TMDB not available.
+    """
+    if not tmdb or not genre_names:
+        return None
+    
+    genre_map = tmdb.get_tv_genres()
+    genre_ids = []
+    
+    for genre_name in genre_names:
+        genre_id = genre_map.get(genre_name.lower())
+        if genre_id:
+            genre_ids.append(str(genre_id))
+    
+    return ",".join(genre_ids) if genre_ids else None
+
 def get_available_genres() -> List[str]:
     """
     Get list of available genre names from TMDB.
@@ -549,7 +667,134 @@ def mood_bias(mood: str) -> Tuple[List[int], List[int]]:
         prefer = [80]        # crime (placeholder for action)
     return prefer, avoid
 
-def build_discover_params(genre, mood, duration, region, language):
+def get_mood_keywords(mood: str) -> Tuple[List[str], List[str]]:
+    """
+    Return positive and negative keywords for semantic matching in series overviews.
+    
+    Args:
+        mood: User's mood preference
+        
+    Returns:
+        Tuple of (positive_keywords, negative_keywords)
+    """
+    mood = (mood or "").lower()
+    positive_keywords = []
+    negative_keywords = []
+    
+    if "light" in mood or "comfort" in mood:
+        positive_keywords = ["fun", "heartwarming", "comedy", "lighthearted", "family", 
+                           "feel-good", "charming", "delightful", "wholesome", "uplifting"]
+        negative_keywords = ["dark", "violent", "disturbing", "intense", "gritty", "brutal"]
+    elif "intens" in mood:
+        positive_keywords = ["intense", "dark", "suspense", "thriller", "dramatic", "gritty",
+                           "complex", "psychological", "tension", "gripping", "powerful"]
+        negative_keywords = ["comedy", "lighthearted", "fun", "family"]
+    elif "mind" in mood:
+        positive_keywords = ["mind-bending", "mystery", "complex", "intricate", "puzzle",
+                           "philosophical", "thought-provoking", "cerebral", "enigmatic", "twist"]
+        negative_keywords = ["straightforward", "simple", "predictable"]
+    elif "adren" in mood:
+        positive_keywords = ["action", "thrilling", "fast-paced", "explosive", "adrenaline",
+                           "chase", "intense", "exciting", "dynamic", "edge"]
+        negative_keywords = ["slow", "quiet", "contemplative", "peaceful"]
+    
+    return positive_keywords, negative_keywords
+
+def score_mood_match_semantic(overview: str, mood: str) -> float:
+    """
+    Score how well a series' overview matches the mood using semantic keyword matching.
+    
+    Args:
+        overview: The series overview/description
+        mood: User's mood preference
+        
+    Returns:
+        float: Score between 0.0 and 1.0 indicating mood match quality
+    """
+    if not overview or not mood:
+        return 0.5  # Neutral score if no overview or mood
+    
+    overview_lower = overview.lower()
+    positive_keywords, negative_keywords = get_mood_keywords(mood)
+    
+    # Count keyword matches
+    positive_matches = sum(1 for keyword in positive_keywords if keyword in overview_lower)
+    negative_matches = sum(1 for keyword in negative_keywords if keyword in overview_lower)
+    
+    # Calculate score: positive matches boost, negative matches reduce
+    # Normalize by the number of keywords we're checking
+    if len(positive_keywords) > 0:
+        positive_score = min(positive_matches / len(positive_keywords), 1.0)
+    else:
+        positive_score = 0.5
+    
+    if len(negative_keywords) > 0:
+        negative_penalty = min(negative_matches / len(negative_keywords), 0.5)
+    else:
+        negative_penalty = 0.0
+    
+    # Final score: start at 0.5 (neutral), add positive, subtract negative
+    final_score = 0.5 + (positive_score * 0.3) - (negative_penalty * 0.2)
+    
+    # Clamp between 0.0 and 1.0
+    return max(0.0, min(1.0, final_score))
+
+def apply_mood_to_score(base_score: float, tv_genres: List[int], overview: str, mood: str) -> float:
+    """
+    Apply mood-based adjustments to the base score (Opzione A + C combined).
+    
+    Args:
+        base_score: The base score before mood adjustment
+        tv_genres: List of genre IDs for the series
+        overview: Series overview/description for semantic matching
+        mood: User's mood preference
+        
+    Returns:
+        float: Adjusted score after mood considerations
+    """
+    if not mood:
+        return base_score
+    
+    mood_lower = mood.lower()
+    genre_multiplier = 1.0
+    
+    # Opzione A: Genre-based mood matching
+    if "intens" in mood_lower:
+        # Boost drama (18) and crime (80)
+        if 18 in tv_genres or 80 in tv_genres:
+            genre_multiplier = 1.15
+    elif "light" in mood_lower or "comfort" in mood_lower:
+        # Boost comedy (35) and animation (16)
+        if 35 in tv_genres or 16 in tv_genres:
+            genre_multiplier = 1.15
+        # Reduce crime (80)
+        if 80 in tv_genres:
+            genre_multiplier = 0.85
+    elif "mind" in mood_lower:
+        # Boost sci-fi&fantasy (10765), mystery (9648)
+        if 10765 in tv_genres or 9648 in tv_genres:
+            genre_multiplier = 1.15
+    elif "adren" in mood_lower:
+        # Boost action & adventure (10759), crime (80)
+        if 10759 in tv_genres or 80 in tv_genres:
+            genre_multiplier = 1.15
+    
+    # Opzione C: Semantic matching in overview
+    semantic_score = score_mood_match_semantic(overview, mood)
+    
+    # Combine genre multiplier and semantic score
+    # Genre multiplier: up to ±15%
+    # Semantic score: up to ±20% (0.8 to 1.2 range)
+    semantic_multiplier = 0.8 + (semantic_score * 0.4)
+    
+    # Apply both adjustments
+    adjusted_score = base_score * genre_multiplier * semantic_multiplier
+    
+    logger.debug(f"Mood adjustment - Genre mult: {genre_multiplier:.2f}, Semantic: {semantic_score:.2f} (mult: {semantic_multiplier:.2f})")
+    
+    return adjusted_score
+
+def build_discover_params(genres, mood, region, language):
     p = {
         "watch_region": region,
         "sort_by": "popularity.desc",
@@ -558,23 +803,16 @@ def build_discover_params(genre, mood, duration, region, language):
         "page": 1
     }
     
-    # Get genre ID from TMDB
-    gid = get_genre_id(genre) if genre else None
-    if gid:
-        p["with_genres"] = gid
-    
-    if duration == "<30m":
-        p["with_runtime.lte"] = 30
-    elif duration == "~45m":
-        p["with_runtime.gte"], p["with_runtime.lte"] = 35, 55
-    elif duration == ">60m":
-        p["with_runtime.gte"] = 60
+    # Get genre IDs from TMDB (supports multiple genres now)
+    genre_ids_str = get_genre_ids(genres) if genres else None
+    if genre_ids_str:
+        p["with_genres"] = genre_ids_str
     
     prefer, avoid = mood_bias(mood)
     
-    # If genre is specified, use mood only for avoid list
-    # If no genre, use mood preferences for genre selection
-    if not gid and prefer:
+    # If genres are specified, use mood only for avoid list
+    # If no genres, use mood preferences for genre selection
+    if not genre_ids_str and prefer:
         p["with_genres"] = ",".join(str(x) for x in prefer)
     
     # Always apply avoid genres
@@ -610,36 +848,95 @@ def _trim_overview(overview: str, limit: int = 280) -> str:
             return cut[:i+1] + "…"
     return cut + "…"
 
-def _score_genre_match(tv_genres, requested_genre):
+def _score_genre_match(tv_genres, requested_genres):
     """
-    Score how well a series matches the requested genre.
+    Score how well a series matches the requested genres.
     For sci-fi requests, prefer series with more 'sci-fi' indicators and fewer fantasy/drama indicators.
+    
+    Args:
+        tv_genres: List of genre IDs for the TV show
+        requested_genres: List of genre names requested by user (e.g., ["sci-fi", "mystery"])
+    
+    Returns:
+        int: Score indicating genre match quality
     """
-    if not requested_genre or requested_genre.lower() not in ["sci-fi", "scifi"]:
-        return 0  # Don't apply scoring for non-sci-fi genres
+    if not requested_genres:
+        return 0
     
-    score = 0
-    # Sci-Fi & Fantasy is the base (always present if we filtered by it)
-    if 10765 in tv_genres:
-        score += 1
+    # Map genre names to TMDB IDs
+    genre_map = {
+        "action": 10759,
+        "action & adventure": 10759,
+        "adventure": 10759,
+        "animation": 16,
+        "comedy": 35,
+        "crime": 80,
+        "documentary": 99,
+        "drama": 18,
+        "family": 10751,
+        "fantasy": 10765,
+        "kids": 10762,
+        "mystery": 9648,
+        "news": 10763,
+        "reality": 10764,
+        "sci-fi": 10765,
+        "sci-fi & fantasy": 10765,
+        "science fiction": 10765,
+        "scifi": 10765,
+        "soap": 10766,
+        "talk": 10767,
+        "war & politics": 10768,
+        "western": 37
+    }
     
-    # Positive indicators for sci-fi (space, action, mystery)
-    if 10759 in tv_genres:  # Action & Adventure
-        score += 2
-    if 9648 in tv_genres:  # Mystery
-        score += 1
-    if 16 in tv_genres:  # Animation (often sci-fi)
-        score += 1
+    # Convert requested genres to IDs
+    requested_ids = set()
+    has_scifi_request = False
+    has_fantasy_request = False
     
-    # Negative indicators (more fantasy/drama than sci-fi)
-    if 18 in tv_genres:  # Drama (very common in fantasy/vampire shows)
-        score -= 1
-    if 80 in tv_genres:  # Crime (often supernatural crime, not sci-fi)
-        score -= 2
-    if 10751 in tv_genres:  # Family
-        score -= 1
+    for g in requested_genres:
+        g_lower = g.lower().strip()
+        if g_lower in ["sci-fi", "scifi", "science fiction"]:
+            has_scifi_request = True
+            requested_ids.add(10765)
+        elif g_lower == "fantasy":
+            has_fantasy_request = True
+            requested_ids.add(10765)
+        elif g_lower in genre_map:
+            requested_ids.add(genre_map[g_lower])
     
-    return score
+    # Base score: count how many requested genres match
+    base_score = len(requested_ids.intersection(set(tv_genres)))
+    
+    # Special logic for sci-fi vs fantasy distinction
+    # Only apply if user specifically requested sci-fi (not fantasy)
+    if has_scifi_request and not has_fantasy_request and 10765 in tv_genres:
+        # User wants sci-fi, series has "Sci-Fi & Fantasy" genre
+        # Now check for sci-fi indicators vs fantasy indicators
+        
+        # Positive indicators for sci-fi (space, action, mystery, tech)
+        scifi_indicators = 0
+        if 10759 in tv_genres:  # Action & Adventure (often sci-fi)
+            scifi_indicators += 2
+        if 9648 in tv_genres:  # Mystery (often sci-fi thrillers)
+            scifi_indicators += 1
+        if 16 in tv_genres:  # Animation (often sci-fi anime)
+            scifi_indicators += 1
+        
+        # Negative indicators (more fantasy/supernatural than sci-fi)
+        fantasy_indicators = 0
+        if 18 in tv_genres:  # Drama (common in fantasy/supernatural)
+            fantasy_indicators += 1
+        if 80 in tv_genres:  # Crime (supernatural crime, not sci-fi)
+            fantasy_indicators += 2
+        if 10751 in tv_genres:  # Family (fairy tales, not sci-fi)
+            fantasy_indicators += 1
+        
+        # Adjust score based on indicators
+        indicator_score = scifi_indicators - fantasy_indicators
+        base_score += indicator_score
+    
+    return max(0, base_score)  # Don't go negative
 
 def _score_freshness(first_air_date):
     """
@@ -739,10 +1036,25 @@ def _add_randomness(base_score, randomness_factor=0.15):
     return base_score + variation
 
 @tool
-def suggest_series(genre: str, mood: str, duration: str,
+def suggest_series(genre: Optional[str], mood: str, duration: Optional[str],
                    providers_text: str, language: str, country: str) -> str:
-    """Return up to 3 series tailored to user slots and country (watchable on owned providers)."""
-    logger.info(f"Suggesting series - Genre: {genre}, Mood: {mood}, Duration: {duration}, Providers: {providers_text}, Lang: {language}, Country: {country}")
+    """
+    Return up to 3 series tailored to user slots and country (watchable on owned providers).
+    
+    Args:
+        genre: Comma-separated genre names or None (e.g., "sci-fi,mystery" or "comedy")
+        mood: User's mood preference
+        duration: Episode duration preference (optional, not used anymore)
+        providers_text: Streaming providers
+        language: Language preference
+        country: User's country code
+    """
+    # Parse genres from comma-separated string
+    genres = None
+    if genre:
+        genres = [g.strip() for g in genre.split(',') if g.strip()]
+    
+    logger.info(f"Suggesting series - Genres: {genres}, Mood: {mood}, Providers: {providers_text}, Lang: {language}, Country: {country}")
     
     if not tmdb:
         logger.error("TMDB API key is missing")
@@ -756,7 +1068,7 @@ def suggest_series(genre: str, mood: str, duration: str,
         region_map = tmdb.region_provider_map(region)
         owned_ids = intersect_providers(user_prov_norm, region_map)
         logger.debug(f"Provider IDs to filter: {owned_ids}")
-        params = build_discover_params(genre, mood, duration, region, language)
+        params = build_discover_params(genres, mood, region, language)
         
         if owned_ids:
             params["with_watch_providers"] = "|".join(str(x) for x in owned_ids)
@@ -792,9 +1104,10 @@ def suggest_series(genre: str, mood: str, duration: str,
         vote_average = tv.get("vote_average", 0)
         vote_count = tv.get("vote_count", 0)
         popularity = tv.get("popularity", 0)
+        overview = tv.get("overview") or ""
         
         # Calculate individual scores
-        genre_score = _score_genre_match(tv_genres, genre)
+        genre_score = _score_genre_match(tv_genres, genres)
         freshness_score = _score_freshness(first_air)
         quality_score = _score_quality(vote_average, vote_count, popularity)
         
@@ -808,13 +1121,16 @@ def suggest_series(genre: str, mood: str, duration: str,
             freshness_score * 0.2
         )
         
-        # Add controlled randomness for variety (±15%)
-        final_score = _add_randomness(base_score, randomness_factor=0.15)
+        # Apply mood adjustments (genre-based + semantic matching in overview)
+        mood_adjusted_score = apply_mood_to_score(base_score, tv_genres, overview, mood)
         
-        overview = _trim_overview(tv.get("overview") or "")
+        # Add controlled randomness for variety (±15%)
+        final_score = _add_randomness(mood_adjusted_score, randomness_factor=0.15)
+        
+        overview_trimmed = _trim_overview(overview)
         scored_candidates.append({
             "title": tv.get("name"),
-            "overview": overview,
+            "overview": overview_trimmed,
             "vote": vote_average,
             "vote_count": vote_count,
             "popularity": popularity,
@@ -824,6 +1140,7 @@ def suggest_series(genre: str, mood: str, duration: str,
             "freshness_score": freshness_score,
             "quality_score": quality_score,
             "base_score": base_score,
+            "mood_adjusted_score": mood_adjusted_score,
             "final_score": final_score,
             "genre_ids": tv_genres
         })
@@ -837,7 +1154,9 @@ def suggest_series(genre: str, mood: str, duration: str,
         logger.debug(
             f"  {i}. {c['title']} ({c['first_air_date']}) - "
             f"Final: {c['final_score']:.2f} "
-            f"[Quality: {c['quality_score']:.2f}, "
+            f"[Base: {c['base_score']:.2f}, "
+            f"Mood-adj: {c['mood_adjusted_score']:.2f}, "
+            f"Quality: {c['quality_score']:.2f}, "
             f"Genre: {c['genre_score']}, "
             f"Fresh: {c['freshness_score']}, "
             f"Votes: {c['vote_count']}, "
@@ -983,40 +1302,38 @@ collect_prompt = ChatPromptTemplate.from_messages([
      "Your job is to understand what they're looking for through natural conversation.\n\n"
      
      "WHAT YOU NEED TO KNOW:\n"
-     "- Genre: {genres}\n"
+     "- Genre(s): {genres} (users can choose ONE or MULTIPLE genres, like 'sci-fi and mystery' or just 'comedy')\n"
      "- Mood/Tone: {moods}\n"
-     "- Episode Duration: {dur}\n"
      "- Language: {langs}\n"
      "- Streaming Services: (any service like Netflix, Prime Video, Disney+, etc.)\n\n"
      
      "WHAT YOU ALREADY KNOW:\n"
-     "- Genre: {current_genre}\n"
+     "- Genre(s): {current_genre}\n"
      "- Mood: {current_mood}\n"
-     "- Duration: {current_duration}\n"
      "- Providers: {current_providers}\n"
      "- Language: {current_language}\n\n"
      
      "HOW TO INTERACT:\n"
      "1. **Extract everything** from the user's message in one go - read carefully!\n"
-     "2. **Keep what you know** - Don't change fields that are already filled unless the user explicitly wants to change them.\n"
-     "3. **Be natural** - If something's missing, ask ONE simple question. Be conversational, friendly, and brief (1-2 sentences max).\n"
-     "4. **Don't repeat yourself** - NEVER ask about information you already have (check WHAT YOU ALREADY KNOW above).\n"
-     "5. **Validate gently** - If the user says something close but not quite right (like 'action' when 'crime' exists), suggest the valid option naturally.\n"
-     "6. **Know when you're done** - Once you have all 5 fields, set ask_next to null.\n\n"
+     "2. **Multiple genres are OK** - If user says 'sci-fi and mystery' or 'comedy, drama', extract as a comma-separated list\n"
+     "3. **Keep what you know** - Don't change fields that are already filled unless the user explicitly wants to change them.\n"
+     "4. **Be natural** - If something's missing, ask ONE simple question. Be conversational, friendly, and brief (1-2 sentences max).\n"
+     "5. **Don't repeat yourself** - NEVER ask about information you already have (check WHAT YOU ALREADY KNOW above).\n"
+     "6. **Validate gently** - If the user says something close but not quite right (like 'action' when 'crime' exists), suggest the valid option naturally.\n"
+     "7. **Know when you're done** - Once you have all 4 required fields (genre, mood, providers, language), set ask_next to null.\n\n"
      
      "EXAMPLES OF NATURAL QUESTIONS (do NOT list options!):\n"
-     "- Missing genre: \"What kind of genre are you in the mood for?\"\n"
-     "- Missing mood: \"How are you feeling today - something light or more intense?\"\n"
-     "- Missing duration: \"Do you prefer short episodes or longer ones?\"\n"
+     "- Missing genre: \"What kind of genre are you in the mood for? You can choose one or more!\"\n"
+     "- Missing mood: \"How are you feeling today? Choose from: light-hearted, intense, mind-blowing, comforting, or adrenaline-fueled.\"\n"
      "- Missing providers: \"Which streaming service do you have?\"\n"
      "- Missing language: \"Any preference on the language?\"\n\n"
      
      "RESPONSE FORMAT (valid JSON only):\n"
      '{{\n'
      '  "known": {{\n'
-     '    "genre": "extracted value or null",\n'
+     '    "genre": "comma-separated genres or null (e.g., \'sci-fi,mystery\' or \'comedy\')",\n'
      '    "mood": "extracted value or null",\n'
-     '    "duration": "extracted value or null",\n'
+     '    "duration": null,\n'
      '    "providers": "extracted value or null",\n'
      '    "language": "extracted value or null"\n'
      '  }},\n'
@@ -1096,12 +1413,22 @@ def merge_prefs(base: UserPrefs, new: UserPrefs) -> UserPrefs:
     data = base.model_dump()
     for k, v in new.model_dump().items():
         if v is not None:
-            data[k] = v
+            # For genres, merge lists instead of replacing
+            if k == 'genre' and isinstance(v, list):
+                existing = data.get('genre')
+                if existing and isinstance(existing, list):
+                    # Combine and deduplicate genres
+                    combined = list(set(existing + v))
+                    data[k] = combined
+                else:
+                    data[k] = v
+            else:
+                data[k] = v
     return UserPrefs(**data)
 
 def prefs_complete(p: UserPrefs) -> bool:
-    """Checks if all 5 slots are filled."""
-    return all([p.genre, p.mood, p.duration, p.providers, p.language])
+    """Checks if all required slots are filled (duration is now optional)."""
+    return all([p.genre, p.mood, p.providers, p.language])
 
 def prefs_minimal_complete(p: UserPrefs) -> bool:
     """Checks if we have the bare minimum to search."""
@@ -1276,8 +1603,20 @@ class BotSession:
         
         # Check if it's a question about a specific show or informational question
         # Keep feedback mode active and answer the question
-        if self.is_informational_question(user_input) or self._is_show_question(user_input):
-            # Answer the question but stay in feedback mode
+        if self._is_show_question(user_input):
+            # Answer the show question but stay in feedback mode
+            self.answer_show_question(user_input)
+            # Return the same feedback prompt
+            next_q = ("How do these look? Please rate:\n"
+                     "• 👍 (or type 'good', 'like', 'yes') if you liked them\n"
+                     "• 👎 (or type 'bad', 'dislike', 'no') if you didn't\n"
+                     "• 'skip' to skip feedback\n"
+                     "Or refine your search (e.g., 'change genre to comedy', 'only Netflix')\n"
+                     "Type 'new' to start over or 'exit' to quit")
+            return True, next_q
+        
+        if self.is_informational_question(user_input):
+            # Answer the informational question but stay in feedback mode
             self.answer_informational_question(user_input)
             # Return the same feedback prompt
             next_q = ("How do these look? Please rate:\n"
@@ -1340,16 +1679,20 @@ class BotSession:
             r'\bwhat about\b',                    # "what about the expanse?"
             r'\bhow about\b',                     # "how about breaking bad?"
             r'\btell me about\b',                 # "tell me about stranger things"
-            r'\bis\s+\w+.*\bavailable\b',         # "is the expanse available?"
-            r'\bdo you have\s+\w+',               # "do you have game of thrones?"
-            r'\bcan (i|you) find\s+\w+',          # "can you find dark?"
-            r'\bwhy (not|isn\'t)\s+\w+',          # "why not the expanse?"
-            r'\bwhere (is|can i watch)\s+\w+',    # "where can i watch the expanse?"
-            r'\bhave you heard of\b',             # "have you heard of The Expanse?"
-            r'\bdo you know\s+\w+',               # "do you know Breaking Bad?"
-            r'\bwhat do you think of\b',          # "what do you think of Stranger Things?"
+            r'\btalk to me about\b',              # "talk to me about lord of mysteries"
+            r'\bis\s+.+\bavailable\b',            # "is the expanse available?"
+            r'\bdo you have\s+["\']?.+["\']?\b',  # "do you have game of thrones?"
+            r'\bcan (i|you) find\s+.+',           # "can you find dark?"
+            r'\bwhy (not|isn\'t)\s+.+',           # "why not the expanse?"
+            r'\bwhere (is|can i watch)\s+.+',     # "where can i watch the expanse?"
+            r'\bhave you heard of\s+["\']?.+["\']?\b',  # "have you heard of The Expanse?"
+            r'\bdo you know\s+["\']?.+["\']?\s*\??\s*$', # "do you know Breaking Bad?" or "Do you know "reincarnated in a sword?""
+            r'\bwhat do you think (of|about)\s+["\']?.+["\']?', # "what do you think about/of Stranger Things?"
             r'\binfo (on|about)\b',               # "info on The Expanse"
             r'\bdetails (on|about)\b',            # "details about Breaking Bad"
+            r'\bever heard of\s+["\']?.+["\']?\b',# "ever heard of X?"
+            r'\bknow anything about\s+.+',        # "know anything about X?"
+            r'\byour (opinion|thoughts?) (on|about)\s+.+', # "your opinion on X"
         ]
         
         for pattern in show_question_patterns:
@@ -1370,25 +1713,31 @@ class BotSession:
         
         # Patterns to extract show name
         patterns = [
-            r'what about\s+(.+)',
-            r'how about\s+(.+)',
-            r'tell me about\s+(.+)',
-            r'is\s+(.+?)\s+available',
-            r'do you have\s+(.+)',
-            r'can (?:i|you) find\s+(.+)',
-            r'why (?:not|isn\'t)\s+(.+)',
-            r'where (?:is|can i watch)\s+(.+)',
-            r'have you heard of\s+(.+)',
-            r'do you know\s+(.+)',
-            r'what do you think of\s+(.+)',
-            r'info (?:on|about)\s+(.+)',
-            r'details (?:on|about)\s+(.+)',
+            r'what about\s+["\']?(.+?)["\']?$',
+            r'how about\s+["\']?(.+?)["\']?$',
+            r'tell me about\s+["\']?(.+?)["\']?$',
+            r'talk to me about\s+["\']?(.+?)["\']?$',
+            r'is\s+["\']?(.+?)["\']?\s+available',
+            r'do you have\s+["\']?(.+?)["\']?$',
+            r'can (?:i|you) find\s+["\']?(.+?)["\']?$',
+            r'why (?:not|isn\'t)\s+["\']?(.+?)["\']?$',
+            r'where (?:is|can i watch)\s+["\']?(.+?)["\']?$',
+            r'have you heard of\s+["\']?(.+?)["\']?$',
+            r'do you know\s+["\']?(.+?)["\']?$',
+            r'what do you think (?:of|about)\s+["\']?(.+?)["\']?$',
+            r'your (?:opinion|thoughts?) (?:on|about)\s+["\']?(.+?)["\']?$',
+            r'info (?:on|about)\s+["\']?(.+?)["\']?$',
+            r'details (?:on|about)\s+["\']?(.+?)["\']?$',
+            r'ever heard of\s+["\']?(.+?)["\']?$',
+            r'know anything about\s+["\']?(.+?)["\']?$',
         ]
         
         for pattern in patterns:
             match = re.search(pattern, user_input, re.IGNORECASE)
             if match:
                 show_name = match.group(1).strip()
+                # Remove surrounding quotes if present
+                show_name = re.sub(r'^["\']|["\']$', '', show_name)
                 # Clean up common trailing words
                 show_name = re.sub(r'\s+(show|series|tv show)$', '', show_name, flags=re.IGNORECASE)
                 return show_name
@@ -1513,11 +1862,10 @@ class BotSession:
                  "You are a helpful TV concierge assistant. Answer the user's question clearly and concisely. "
                  "Be friendly and informative. Keep your answer to 2-3 sentences.\n\n"
                  "CONTEXT:\n"
-                 f"- Current preferences: genre={self.prefs.genre}, mood={self.prefs.mood}, duration={self.prefs.duration}, providers={self.prefs.providers}, language={self.prefs.language}\n"
+                 f"- Current preferences: genre={self.prefs.genre}, mood={self.prefs.mood}, providers={self.prefs.providers}, language={self.prefs.language}\n"
                  f"- Supported platforms: Netflix, Prime Video, Disney+, Apple TV+, HBO Max, Hulu, and many others\n"
                  f"- Supported genres: {', '.join(sorted(get_allowed_genres()))}\n"
                  f"- Supported moods: {', '.join(sorted(ALLOWED_MOOD))}\n"
-                 f"- Duration options: <30m (short episodes), ~45m (standard), >60m (long episodes)\n"
                  f"- Languages: {', '.join(sorted(ALLOWED_LANG))}\n\n"
                  "INSTRUCTIONS:\n"
                  "1. If asked about system capabilities:\n"
@@ -1549,6 +1897,193 @@ class BotSession:
             print(f"ai> I'm having trouble understanding. Could you rephrase that?\n")
             return True
     
+    def is_off_topic(self, user_input: str, last_bot_question: str = "") -> bool:
+        """
+        Check if the user input is completely off-topic (not related to TV series at all).
+        Uses LLM to intelligently detect off-topic conversations.
+        
+        Args:
+            user_input: The user's message
+            last_bot_question: The last question asked by the bot (for context)
+        
+        Returns True if the input seems unrelated to TV series recommendations.
+        """
+        user_lower = user_input.lower().strip()
+        
+        # Very short inputs are usually not off-topic
+        if len(user_input.strip()) < 5:
+            return False
+        
+        # Quick check: obvious on-topic keywords
+        on_topic_keywords = [
+            'show', 'series', 'tv', 'watch', 'episode', 'season', 'stream',
+            'netflix', 'prime', 'disney', 'hbo', 'genre', 'recommend', 'suggestion',
+            'sci-fi', 'comedy', 'drama', 'thriller', 'mystery', 'animation',
+            'intense', 'light', 'light-hearted', 'mood', 'duration', 'language',
+            'english', 'italian', 'japanese', 'korean', 'short', 'long', 'standard'
+        ]
+        
+        # If it contains obvious on-topic keywords, it's not off-topic
+        if any(keyword in user_lower for keyword in on_topic_keywords):
+            return False
+        
+        # Quick regex check for obvious cases (faster than LLM call)
+        obvious_off_topic = [
+            r'\b(weather|wheater|temperature|forecast|rain|sunny|cloud)\b',
+            r'\b(recipe|cook|bake|pizza|pasta|burger|meal|eat|hungry|food)\b',
+            r'\b(math|calculate|equation|formula|algebra)\b',
+            r'\b(stock|invest|trading|crypto|bitcoin)\b',
+        ]
+        
+        for pattern in obvious_off_topic:
+            if re.search(pattern, user_lower):
+                # Check if they're talking about a show
+                show_context = any([
+                    'show' in user_lower,
+                    'series' in user_lower,
+                    'watch' in user_lower,
+                    'tv' in user_lower,
+                    'episode' in user_lower,
+                ])
+                if not show_context:
+                    logger.info(f"Off-topic detected via regex: {pattern}")
+                    return True
+        
+        # Use LLM for nuanced detection with conversation context
+        try:
+            context_info = ""
+            if last_bot_question:
+                context_info = f"\n\nPrevious bot question: {last_bot_question}"
+            
+            off_topic_prompt = ChatPromptTemplate.from_messages([
+                ("system",
+                 "You are a classifier that determines if a user's message is related to TV series recommendations.\n\n"
+                 "TV Series topics include:\n"
+                 "- Asking for series recommendations (genre, mood, platform, etc.)\n"
+                 "- Answering questions about preferences (e.g., 'intense', 'light-hearted', '~45m')\n"
+                 "- Asking about specific TV shows\n"
+                 "- Questions about streaming platforms or availability\n"
+                 "- Preferences for watching series (duration, language, etc.)\n"
+                 "- Feedback on recommendations\n\n"
+                 "Off-topic includes:\n"
+                 "- Weather, food, sports, politics, health, finance, etc.\n"
+                 "- Math problems, translations, jokes\n"
+                 "- Anything not related to TV series or entertainment\n\n"
+                 "If the user is answering a question from the bot, consider it on-topic if it's about preferences."
+                 "{context}"
+                 "\n\nRespond ONLY with 'on-topic' or 'off-topic' (no explanation)."),
+                ("human", "{user_input}")
+            ])
+            
+            classifier_chain = off_topic_prompt | llm_base
+            result = classifier_chain.invoke({
+                "user_input": user_input,
+                "context": context_info
+            })
+            
+            # Extract content from the result
+            content = result.content if hasattr(result, 'content') else str(result)
+            
+            # Handle if content is a list (sometimes LangChain returns list of content blocks)
+            if isinstance(content, list):
+                # Join list elements if it's a list
+                classification = " ".join(str(item) for item in content).strip().lower()
+            else:
+                classification = str(content).strip().lower()
+            
+            is_off = "off-topic" in classification
+            
+            if is_off:
+                logger.info(f"Off-topic detected via LLM: {user_input}")
+            else:
+                logger.debug(f"On-topic confirmed via LLM: {user_input}")
+            
+            return is_off
+            
+            return is_off
+            
+        except Exception as e:
+            logger.error(f"LLM off-topic detection failed: {e}")
+            # Fallback to False (don't block if LLM fails)
+            return False
+    
+    def _looks_like_question(self, user_input: str) -> bool:
+        """
+        Check if the input looks like a question.
+        """
+        user_input = user_input.strip()
+        
+        # Ends with question mark
+        if user_input.endswith('?'):
+            return True
+        
+        # Starts with question words
+        question_starters = ['what', 'why', 'how', 'when', 'where', 'who', 'which', 'can', 'do', 'does', 'is', 'are']
+        first_word = user_input.lower().split()[0] if user_input else ""
+        if first_word in question_starters:
+            return True
+        
+        return False
+    
+    def get_contextual_help_message(self) -> str:
+        """
+        Generate a contextual help message based on the current state of the conversation.
+        This helps users understand what the bot needs or can do.
+        """
+        # Check if we're waiting for feedback
+        if self.waiting_for_feedback:
+            return (
+                "I can help you find TV series to watch! 📺\n\n"
+                "Right now, I'm waiting for your feedback on my suggestions:\n"
+                "• Rate them with 👍 (good) or 👎 (bad)\n"
+                "• Type 'skip' if you don't want to give feedback\n"
+                "• Or refine your search (e.g., 'change genre to comedy')\n"
+                "• Type 'new' to start a fresh search"
+            )
+        
+        # Check what we still need
+        missing = []
+        if not self.prefs.genre:
+            missing.append("genre (e.g., sci-fi, comedy, drama)")
+        if not self.prefs.mood:
+            missing.append("mood (e.g., intense, light-hearted)")
+        if not self.prefs.providers:
+            missing.append("streaming platform (e.g., Netflix, Prime Video)")
+        if not self.prefs.language:
+            missing.append("language (e.g., English, Italian, any)")
+        
+        # Check what we have
+        have = []
+        if self.prefs.genre:
+            have.append(f"genre: {', '.join(self.prefs.genre)}")
+        if self.prefs.mood:
+            have.append(f"mood: {self.prefs.mood}")
+        if self.prefs.providers:
+            have.append(f"platform: {self.prefs.providers}")
+        if self.prefs.language:
+            have.append(f"language: {self.prefs.language}")
+        
+        # Build the message
+        msg = "I can help you find TV series to watch! 📺\n\n"
+        
+        if have:
+            msg += f"✓ What I know: {', '.join(have)}\n\n"
+        
+        if missing:
+            if len(missing) == 1:
+                msg += f"I still need: {missing[0]}\n\n"
+            elif len(missing) <= 3:
+                msg += f"I still need: {' and '.join([', '.join(missing[:-1]), missing[-1]])}\n\n"
+            else:
+                msg += f"I still need: {', '.join(missing[:-1])}, and {missing[-1]}\n\n"
+            
+            msg += "💡 Tip: Just tell me naturally what you're looking for!\n"
+            msg += "   Example: 'sci-fi and mystery on Netflix, intense, English'"
+        else:
+            msg += "I have all the info I need! Type 'search' to find suggestions."
+        
+        return msg
+    
     def extract_preferences(self, user_input: str) -> Optional[str]:
         """
         Extract preferences from user input.
@@ -1564,11 +2099,9 @@ class BotSession:
                 collect_prompt.partial(
                     genres=", ".join(sorted(get_allowed_genres())),
                     moods=", ".join(sorted(ALLOWED_MOOD)),
-                    dur=", ".join(sorted(ALLOWED_DURATION)),
                     langs=", ".join(sorted(ALLOWED_LANG)),
-                    current_genre=self.prefs.genre or "null",
+                    current_genre=", ".join(self.prefs.genre) if self.prefs.genre else "null",
                     current_mood=self.prefs.mood or "null",
-                    current_duration=self.prefs.duration or "null",
                     current_providers=self.prefs.providers or "null",
                     current_language=self.prefs.language or "null"
                 )
@@ -1580,17 +2113,35 @@ class BotSession:
             validated_prefs = validate_prefs(collect.known)
             logger.debug(f"Extracted preferences: {validated_prefs}")
             
+            # Store old prefs to check if extraction made progress
+            old_prefs = self.prefs.model_dump()
             self.prefs = merge_prefs(self.prefs, validated_prefs)
+            new_prefs = self.prefs.model_dump()
+            
+            # Check if extraction made no progress and input wasn't empty
+            no_progress = (
+                old_prefs == new_prefs and  # No change in preferences
+                not any(validated_prefs.model_dump().values()) and  # Nothing was extracted
+                len(user_input.strip()) > 3 and  # Input wasn't trivial
+                not self._looks_like_question(user_input) and  # And it wasn't a question
+                self.repeat_count >= 2  # After 2 repeated questions, show help
+            )
+            
+            if no_progress:
+                logger.warning(f"No progress after {self.repeat_count} attempts with input: {user_input}")
+                # Return contextual help
+                return "CONTEXTUAL_HELP"
+            
             next_q = None if prefs_complete(self.prefs) else (collect.ask_next or "What other preference can you tell me?")
             
             logger.info(f"Current preferences: genre={self.prefs.genre}, mood={self.prefs.mood}, "
-                       f"duration={self.prefs.duration}, providers={self.prefs.providers}, language={self.prefs.language}")
+                       f"providers={self.prefs.providers}, language={self.prefs.language}")
             return next_q
             
         except Exception as e:
             logger.error(f"Failed to parse user input: {e}", exc_info=True)
-            print(f"ai> I'm having trouble understanding. Could you rephrase that?\n")
-            return "ERROR"  # Return special marker for error
+            # Return contextual help instead of generic error
+            return "CONTEXTUAL_HELP"  # Return special marker for contextual help
     
     def perform_search(self) -> bool:
         """
@@ -1616,8 +2167,10 @@ class BotSession:
             
             # Get suggestions
             logger.info("Requesting series suggestions")
+            # Convert genre list to comma-separated string for the tool
+            genre_str = ",".join(self.prefs.genre) if self.prefs.genre else None
             sugg_res = suggest_series.invoke({
-                "genre": self.prefs.genre,
+                "genre": genre_str,
                 "mood": self.prefs.mood,
                 "duration": self.prefs.duration,
                 "providers_text": self.prefs.providers,
@@ -1678,11 +2231,10 @@ class BotSession:
     def run(self):
         """Run the main conversation loop."""
         print("🍿 SerieBot — Geo-located TV Suggestions (OVH + LangChain + ipinfo + TMDB)")
-        print("Type 'exit' to quit, 'new' to start over, or 'search' to search with current preferences.")
-        print("💡 Tip: For duration, use '<30m' for short, '~45m' for standard, or '>60m' for long episodes.\n")
+        print("Type 'exit' to quit, 'new' to start over, or 'search' to search with current preferences.\n")
         
         ask_next = ("Hi! 👋 What kind of TV series are you looking for?\n"
-                   "You can tell me about genre, mood, duration, language, or platforms (e.g., Netflix, Prime)...")
+                   "You can tell me about genre, mood, language, or platforms (e.g., Netflix, Prime)...")
         
         while True:
             self.conversation_turn += 1
@@ -1693,10 +2245,13 @@ class BotSession:
                 self.repeat_count += 1
                 logger.warning(f"Same question repeated {self.repeat_count} times")
                 if self.repeat_count >= 3:
-                    logger.error("Infinite loop detected, forcing search")
-                    print("\nai> I notice we're stuck in a loop. Let me search with what we have so far...\n")
-                    self.is_force_search = True
+                    logger.error("Too many repeats detected, showing contextual help")
+                    help_msg = self.get_contextual_help_message()
+                    print(f"\nai> I notice we're going in circles. Let me help! 🔄\n")
+                    print(f"{help_msg}\n")
                     self.repeat_count = 0
+                    self.last_ask_next = None
+                    continue
                 else:
                     self.is_force_search = False
             else:
@@ -1739,17 +2294,71 @@ class BotSession:
                 self.is_force_search = True
                 logger.info("User forced search")
             
-            # Handle informational questions
+            # Handle questions about specific shows (check first, most specific)
+            if self._is_show_question(user_in) and not self.is_force_search:
+                self.answer_show_question(user_in)
+                continue
+            
+            # Check if input is completely off-topic (BEFORE informational questions)
+            if self.is_off_topic(user_in, self.last_ask_next or "") and not self.is_force_search:
+                logger.warning(f"Off-topic input detected: {user_in}")
+                help_msg = self.get_contextual_help_message()
+                print(f"\nai> I appreciate you talking to me, but I specialize in TV series recommendations! 😊\n")
+                print(f"{help_msg}\n")
+                continue
+            
+            # Handle informational questions (about the bot's capabilities)
             if self.is_informational_question(user_in) and not self.is_force_search:
                 self.answer_informational_question(user_in)
+                # Don't repeat the last question after answering an informational question
+                ask_next = None
                 continue
             
             # Extract preferences
+            something_extracted = False  # Track if we extracted anything new
+            extracted_items = []  # Track what was extracted
+            
             if not self.is_force_search:
+                # Store current preferences to detect what changed
+                prefs_before = self.prefs.model_dump()
+                
                 ask_next = self.extract_preferences(user_in)
-                if ask_next == "ERROR":
-                    # Extraction failed, skip to next iteration
+                if ask_next == "CONTEXTUAL_HELP":
+                    # Show contextual help instead of generic error
+                    help_msg = self.get_contextual_help_message()
+                    print(f"\nai> {help_msg}\n")
+                    # Reset ask_next to avoid showing the marker
+                    ask_next = None
                     continue
+                
+                # Check if any preferences were actually extracted and what changed
+                prefs_after = self.prefs.model_dump()
+                
+                # Mapping for user-friendly names
+                field_names = {
+                    'genre': 'genre',
+                    'mood': 'mood',
+                    'duration': 'duration',
+                    'providers': 'platform',
+                    'language': 'language'
+                }
+                
+                for key in prefs_after.keys():
+                    if prefs_before.get(key) != prefs_after.get(key):
+                        value = prefs_after.get(key)
+                        if value is not None:
+                            # Format the value nicely
+                            if isinstance(value, list):
+                                formatted_value = ', '.join(value)
+                            else:
+                                formatted_value = str(value)
+                            
+                            # Use friendly field name
+                            friendly_name = field_names.get(key, key)
+                            extracted_items.append(f"{friendly_name}: {formatted_value}")
+                
+                something_extracted = len(extracted_items) > 0
+                
                 # If ask_next is None, preferences are complete, continue to search check
             
             # Check if ready to search
@@ -1760,16 +2369,18 @@ class BotSession:
                     print("ai> I need a bit more info to search. Please tell me at least a (genre or mood) AND a provider.\n")
                     print(f"   📝 Available genres: {', '.join(sorted(get_allowed_genres()))}")
                     print(f"   🎭 Available moods: {', '.join(sorted(ALLOWED_MOOD))}")
-                    print(f"   ⏱️  Duration options: <30m (short), ~45m (standard), >60m (long)")
                     print()
                 else:
-                    missing = [k for k,v in self.prefs.model_dump().items() if v is None]
+                    missing = [k for k,v in self.prefs.model_dump().items() if v is None and k != 'duration']
                     if missing:
                         logger.debug(f"Still missing: {missing}")
-                        if 'duration' in missing and self.repeat_count > 0:
-                            print(f"ai> For duration, please choose one of these: <30m, ~45m, or >60m\n")
-                        else:
-                            print(f"ai> Got it! Still need: {', '.join(missing)}.\n")
+                        # Only show "Got it! Still need..." if we extracted something new
+                        if something_extracted and self.repeat_count == 0:
+                            # Show what we understood
+                            got_message = "Got it! " + ", ".join(extracted_items) + "."
+                            if len(missing) > 0:
+                                got_message += f" Still need: {', '.join(missing)}."
+                            print(f"ai> {got_message}\n")
                 continue
             
             # Perform search
