@@ -137,8 +137,8 @@ def setup_feedback_system():
         with open(FEEDBACK_FILE, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'timestamp', 'session_id', 'rating', 'genre', 'mood', 
-                'duration', 'providers', 'language', 'country', 
+                'timestamp', 'session_id', 'rating', 'genre', 'mood',
+                'providers', 'language', 'country', 
                 'suggestions_count', 'comment'
             ])
         logger.info(f"Created feedback file: {FEEDBACK_FILE}")
@@ -158,7 +158,6 @@ def save_feedback(session_id: str, rating: str, prefs: 'UserPrefs',
                 rating,
                 genre_str,
                 prefs.mood or "N/A",
-                prefs.duration or "N/A",
                 prefs.providers or "N/A",
                 prefs.language or "N/A",
                 country,
@@ -544,7 +543,6 @@ def detect_force_search_intent(user_input: str, current_prefs: dict) -> bool:
 # This is just a fallback for validation
 ALLOWED_GENRES = {"sci-fi","crime","drama","comedy","animation","fantasy","mystery","documentary"}
 ALLOWED_MOOD = {"light-hearted","intense","mind-blowing","comforting","adrenaline-fueled"}
-ALLOWED_DURATION = {"<30m","~45m",">60m"}
 ALLOWED_LANG = {"it","en","any"}
 
 def get_allowed_genres() -> set:
@@ -562,7 +560,6 @@ class UserPrefs(BaseModel):
     """Holds all user preferences."""
     genre: Optional[List[str]] = None  # Changed to list to support multiple genres
     mood: Optional[str] = None
-    duration: Optional[str] = None
     providers: Optional[str] = None
     language: Optional[str] = None
     
@@ -1364,7 +1361,7 @@ def _add_randomness(base_score, randomness_factor=0.15):
     return base_score + variation
 
 @tool
-def suggest_series(genre: Optional[str], mood: Optional[str], duration: Optional[str],
+def suggest_series(genre: Optional[str], mood: Optional[str],
                    providers_text: str, language: str, country: str) -> str:
     """
     Return up to 3 series tailored to user slots and country (watchable on owned providers).
@@ -1372,7 +1369,6 @@ def suggest_series(genre: Optional[str], mood: Optional[str], duration: Optional
     Args:
         genre: Comma-separated genre names or None (e.g., "sci-fi,mystery" or "comedy")
         mood: User's mood preference (optional)
-        duration: Episode duration preference (optional, not used anymore)
         providers_text: Streaming providers
         language: Language preference
         country: User's country code
@@ -1687,7 +1683,6 @@ collect_prompt = ChatPromptTemplate.from_messages([
      '  "known": {{\n'
      '    "genre": "comma-separated genres or null (e.g., \'sci-fi,mystery\' or \'comedy\')",\n'
      '    "mood": "extracted value or null",\n'
-     '    "duration": null,\n'
      '    "providers": "extracted value or null",\n'
      '    "language": "extracted value or null"\n'
      '  }},\n'
@@ -1789,7 +1784,7 @@ def merge_prefs(base: UserPrefs, new: UserPrefs) -> UserPrefs:
     return UserPrefs(**data)
 
 def prefs_complete(p: UserPrefs) -> bool:
-    """Checks if all required slots are filled (duration is now optional)."""
+    """Checks if all required slots are filled."""
     return all([p.genre, p.mood, p.providers, p.language])
 
 def prefs_minimal_complete(p: UserPrefs) -> bool:
@@ -1935,7 +1930,7 @@ def collecting_node(state: ConversationState) -> ConversationState:
     for field, value_after in prefs_after.items():
         value_before = prefs_before.get(field)
         # If value changed and is not None, it was just extracted
-        if value_after != value_before and value_after is not None and field != 'duration':
+        if value_after != value_before and value_after is not None:
             # Format the value nicely
             if isinstance(value_after, list):
                 formatted_value = ', '.join(value_after)
@@ -2042,7 +2037,6 @@ def searching_node(state: ConversationState) -> ConversationState:
         result_json = suggest_series.invoke({
             "genre": genre_str,
             "mood": prefs.mood,
-            "duration": prefs.duration,
             "providers_text": providers_str,
             "language": prefs.language,
             "country": country
@@ -2127,7 +2121,7 @@ class BotSession:
         
         self.search_keywords = {
             "netflix", "prime", "disney", "apple tv", "hbo", "hulu", 
-            "genre", "mood", "duration", "language", "provider", "platform"
+            "genre", "mood", "language", "provider", "platform"
         }
         
         logger.info(f"New session created: {self.session_id}")
@@ -2230,12 +2224,12 @@ class BotSession:
         
         # Check for explicit list/options requests
         list_request_patterns = [
-            r'\b(which|what)\s+(genre|mood|duration|language|provider|platform)s?\s+(can|should|do|are)',
+            r'\b(which|what)\s+(genre|mood|language|provider|platform)s?\s+(can|should|do|are)',
             r'\bgive\s+me\s+(the\s+)?(list|options)',
             r'\bshow\s+me\s+(the\s+)?(list|options|choices)',
             r'\bwhat\s+(are\s+)?(the\s+)?(available|possible|valid)',
             r'\bi\s+need\s+(the\s+)?list',
-            r'\blist\s+of\s+(genre|mood|duration|language|provider)s?',
+            r'\blist\s+of\s+(genre|mood|language|provider)s?',
         ]
         
         for pattern in list_request_patterns:
@@ -2513,8 +2507,8 @@ class BotSession:
             'show', 'series', 'tv', 'watch', 'episode', 'season', 'stream',
             'netflix', 'prime', 'disney', 'hbo', 'genre', 'recommend', 'suggestion',
             'sci-fi', 'comedy', 'drama', 'thriller', 'mystery', 'animation',
-            'intense', 'light', 'light-hearted', 'mood', 'duration', 'language',
-            'english', 'italian', 'japanese', 'korean', 'short', 'long', 'standard'
+            'intense', 'light', 'light-hearted', 'mood', 'language',
+            'english', 'italian', 'japanese', 'korean'
         ]
         
         # If it contains obvious on-topic keywords, it's not off-topic
