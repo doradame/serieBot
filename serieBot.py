@@ -31,7 +31,6 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.tools import tool
 from langchain_core.runnables import RunnableSequence
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
 
 # Load environment variables from .env file
 try:
@@ -91,6 +90,7 @@ def setup_logging():
 # =========================
 # Config & env
 # =========================
+# API Configuration
 TMDB_KEY = os.getenv("TMDB_API_KEY")
 OVH_BASE = os.getenv("OPENAI_API_BASE", "https://api.ai.ovh.net/v1")
 OVH_KEY  = os.getenv("OPENAI_API_KEY")
@@ -98,15 +98,29 @@ MODEL    = os.getenv("OVH_MODEL") or None  # None allows the API to use its defa
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "en")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
+# Algorithm Constants
+MAX_CANDIDATES = 12  # Maximum candidate shows to evaluate
+TOP_SUGGESTIONS = 3  # Number of top suggestions to return
+MAX_REPEATS = 3      # Max times to ask for same missing info before showing examples
+TMDB_RATE_LIMIT = 0.25  # Seconds between TMDB API calls
+
+# Temperature settings for different LLM purposes
+TEMP_EXTRACT = 0.0   # Deterministic extraction
+TEMP_CREATIVE = 0.7  # Natural response generation
+TEMP_CLASSIFY = 0.3  # Balanced classification
+
 # Initialize logging (DEBUG already defined above)
 logger = setup_logging()
 logger.info(f"Configuration loaded - TMDB: {'✓' if TMDB_KEY else '✗'}, OVH: {'✓' if OVH_KEY else '✗'}")
 logger.info(f"Model: {MODEL or 'gpt-oss-120b'}, Base URL: {OVH_BASE}")
 
 if not OVH_KEY:
-    raise SystemExit("Missing OPENAI_API_KEY (OVH AI Endpoints).")
+    logger.error("Missing OPENAI_API_KEY environment variable")
+    raise SystemExit("❌ Error: Missing OPENAI_API_KEY (OVH AI Endpoints). Please set it in your .env file.")
+
 if not TMDB_KEY:
-    print("WARNING: Missing TMDB_API_KEY — suggestions might fail.", flush=True)
+    logger.error("Missing TMDB_API_KEY environment variable")
+    raise SystemExit("❌ Error: Missing TMDB_API_KEY. Please set it in your .env file or get one from https://www.themoviedb.org/settings/api")
 
 # =========================
 # Feedback System
@@ -246,7 +260,7 @@ def normalize_providers_llm(user_text: str) -> List[str]:
     ])
     
     try:
-        provider_chain = provider_prompt | llm_base
+        provider_chain = provider_prompt | llm_classify  # Use classifier LLM
         response = provider_chain.invoke({"user_text": user_text})
         
         # Extract content
@@ -262,8 +276,11 @@ def normalize_providers_llm(user_text: str) -> List[str]:
         
         return valid_providers
         
+    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+        logger.error(f"Failed to parse LLM provider response: {e}")
+        return []
     except Exception as e:
-        logger.error(f"Failed to normalize providers with LLM: {e}")
+        logger.error(f"Unexpected error in provider normalization: {e}")
         return []
 
 def validate_mood_llm(user_mood: str) -> Optional[str]:
@@ -305,7 +322,7 @@ def validate_mood_llm(user_mood: str) -> Optional[str]:
     ])
     
     try:
-        mood_chain = mood_prompt | llm_base
+        mood_chain = mood_prompt | llm_classify  # Use classifier LLM
         response = mood_chain.invoke({"user_mood": user_mood})
         
         # Extract content
@@ -323,8 +340,72 @@ def validate_mood_llm(user_mood: str) -> Optional[str]:
         
         return None
         
+    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+        logger.error(f"Failed to parse LLM mood response: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Failed to validate mood with LLM: {e}")
+        logger.error(f"Unexpected error in mood validation: {e}")
+        return None
+
+def validate_language_llm(user_language: str) -> Optional[str]:
+    """
+    Use LLM to intelligently map user's language preference to canonical language.
+    Handles variations like 'any will be fine', 'doesn't matter', 'no preference' → 'any'.
+    """
+    if not user_language:
+        return None
+    
+    language_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a language preference classifier for TV series recommendations. Your job is to map "
+         "user's language descriptions to canonical language codes.\n\n"
+         "CANONICAL LANGUAGES:\n"
+         f"{', '.join(sorted(ALLOWED_LANG))}\n\n"
+         "LANGUAGE MAPPINGS:\n"
+         "- 'any', 'any language', 'doesn't matter', 'no preference', 'whatever', 'any will/would be fine/good/ok' → 'any'\n"
+         "- 'english', 'eng', 'en' → 'en'\n"
+         "- 'italian', 'italiano', 'ita', 'it' → 'it'\n\n"
+         "INSTRUCTIONS:\n"
+         "1. Analyze the user's language input\n"
+         "2. Map it to the canonical language code\n"
+         "3. If uncertain, return 'any' as default\n"
+         "4. Return ONLY the exact canonical code\n\n"
+         "RESPONSE FORMAT (valid JSON string only):\n"
+         '"en" or "it" or "any"\n\n'
+         "EXAMPLES:\n"
+         "Input: 'English' → \"en\"\n"
+         "Input: 'italiano' → \"it\"\n"
+         "Input: 'any will be fine' → \"any\"\n"
+         "Input: 'doesn\\'t matter' → \"any\"\n"
+         "Input: 'no preference' → \"any\"\n"
+        ),
+        ("human", "{user_language}")
+    ])
+    
+    try:
+        language_chain = language_prompt | llm_classify  # Use classifier LLM
+        response = language_chain.invoke({"user_language": user_language})
+        
+        # Extract content
+        content = response.content if hasattr(response, 'content') else str(response)
+        logger.debug(f"LLM language response: {content}")
+        
+        # Parse JSON - ensure content is a string
+        content_str = content if isinstance(content, str) else str(content)
+        language = json.loads(content_str.strip())
+        
+        # Validate that returned language is in canonical list
+        if language and language in ALLOWED_LANG:
+            logger.info(f"LLM mapped language: '{user_language}' -> '{language}'")
+            return language
+        
+        return None
+        
+    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+        logger.error(f"Failed to parse LLM language response: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error in language validation: {e}")
         return None
 
 def validate_genre_llm(user_genres: List[str]) -> List[str]:
@@ -371,7 +452,7 @@ def validate_genre_llm(user_genres: List[str]) -> List[str]:
     ])
     
     try:
-        genre_chain = genre_prompt | llm_base
+        genre_chain = genre_prompt | llm_classify  # Use classifier LLM
         response = genre_chain.invoke({"user_genres": json.dumps(user_genres)})
         
         # Extract content
@@ -390,9 +471,73 @@ def validate_genre_llm(user_genres: List[str]) -> List[str]:
         
         return valid_genres
         
-    except Exception as e:
-        logger.error(f"Failed to validate genres with LLM: {e}")
+    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+        logger.error(f"Failed to parse LLM genre response: {e}")
         return []
+    except Exception as e:
+        logger.error(f"Unexpected error in genre validation: {e}")
+        return []
+
+def detect_force_search_intent(user_input: str, current_prefs: dict) -> bool:
+    """
+    Use LLM to detect if user wants to skip remaining questions and search immediately.
+    This is more intelligent than keyword matching.
+    
+    Args:
+        user_input: User's message
+        current_prefs: Current preferences collected (dict with genre, mood, providers, language)
+        
+    Returns:
+        bool: True if user wants to force search now
+    """
+    # Quick checks first
+    if not user_input or len(user_input.strip()) < 3:
+        return False
+    
+    # Count how many prefs are filled
+    filled_count = sum(1 for v in current_prefs.values() if v is not None)
+    
+    # If nothing is filled, definitely not a force search
+    if filled_count == 0:
+        return False
+    
+    # Create prompt
+    force_search_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are analyzing user intent in a TV series recommendation conversation. "
+         "The bot is collecting preferences (genre, mood, platform, language) before searching.\n\n"
+         "Your job: Determine if the user wants to SKIP remaining questions and search NOW.\n\n"
+         "FORCE SEARCH indicators:\n"
+         "- Explicit: 'search now', 'just search', 'that's enough', 'go ahead', 'find something'\n"
+         "- Impatient: 'I don't care about the rest', 'whatever', 'just show me', 'skip the questions'\n"
+         "- Satisfied: 'I'm good', 'that's all I need', 'this is enough'\n\n"
+         "NOT force search (normal conversation):\n"
+         "- Answering a question: 'I'll go with comedy', 'I prefer Netflix', 'English please'\n"
+         "- Casual language: 'let me think', 'hmm, maybe action', 'I like drama'\n"
+         "- Questions: 'what about...', 'do you have...', 'can you suggest...'\n\n"
+         f"Context: User has provided {filled_count}/4 preferences so far.\n\n"
+         "Respond with ONLY 'true' or 'false'."),
+        ("user", "{user_input}")
+    ])
+    
+    try:
+        force_chain = force_search_prompt | llm_classify
+        response = force_chain.invoke({"user_input": user_input})
+        
+        content = response.content if hasattr(response, 'content') else str(response)
+        content_str = content if isinstance(content, str) else str(content)
+        result = content_str.strip().lower() == 'true'
+        
+        if result:
+            logger.info(f"Force search intent detected in: '{user_input}'")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to detect force search intent: {e}")
+        # Fallback to simple keyword check
+        simple_keywords = {"search now", "just search", "that's enough", "skip"}
+        return any(kw in user_input.lower() for kw in simple_keywords)
 
 # =========================
 # Pydantic models (typed I/O)
@@ -460,6 +605,9 @@ class Suggestions(BaseModel):
 # =========================
 class ConversationState(TypedDict):
     """State for LangGraph conversation flow."""
+    # Bot instance for accessing methods
+    bot: 'BotSession'
+    
     # User preferences being collected
     prefs: UserPrefs
     
@@ -467,16 +615,21 @@ class ConversationState(TypedDict):
     session_id: str
     user_input: str
     next_question: Optional[str]
+    last_ask_next: Optional[str]
+    repeat_count: int
+    conversation_turn: int
     
     # Geolocation cache
     geo_cache: Optional[Dict]
     
     # Suggestions tracking
     last_suggestions_count: int
+    last_suggestions: Optional[List[Dict]]
     
     # Flow control
     waiting_for_feedback: bool
     prefs_complete: bool
+    is_force_search: bool
     
     # Current state
     current_state: Literal["greeting", "collecting", "searching", "feedback", "end"]
@@ -548,7 +701,7 @@ def validate_prefs(prefs: UserPrefs) -> Tuple[UserPrefs, Dict]:
     else:
         validated_data['mood'] = None
     
-    # Validate language - with smart mapping
+    # Validate language - try LLM first for smart mapping
     if prefs.language:
         lang_lower = prefs.language.lower().strip()
         
@@ -556,20 +709,20 @@ def validate_prefs(prefs: UserPrefs) -> Tuple[UserPrefs, Dict]:
         if lang_lower in ALLOWED_LANG:
             validated_data['language'] = lang_lower
         else:
-            # Map common language names to codes
-            lang_map = {
-                'english': 'en',
-                'italian': 'it',
-                'italiano': 'it',
-                'inglese': 'en',
-                'any language': 'any',
-                'all languages': 'any',
-                'no preference': 'any'
-            }
-            
-            if lang_lower in lang_map:
-                validated_data['language'] = lang_map[lang_lower]
-            else:
+            # Try LLM to map variations like "any will be fine", "doesn't matter"
+            try:
+                llm_language = validate_language_llm(prefs.language)
+                if llm_language:
+                    validated_data['language'] = llm_language
+                    # Store mapping info for user feedback
+                    mapping_info['language'] = {
+                        'original': prefs.language,
+                        'mapped': llm_language
+                    }
+                else:
+                    validated_data['language'] = None
+            except Exception as e:
+                logger.warning(f"LLM language validation failed: {e}")
                 validated_data['language'] = None
     else:
         validated_data['language'] = None
@@ -605,7 +758,7 @@ def ipinfo_location() -> str:
 # --- TMDB helpers/classes
 class TMDB:
     BASE = "https://api.themoviedb.org/3"
-    RATE_LIMIT_DELAY = float(os.getenv("TMDB_RATE_LIMIT", "0.25"))  # Rate limit from env
+    RATE_LIMIT_DELAY = TMDB_RATE_LIMIT  # Use constant from config
     
     def __init__(self, api_key: str):
         self.key = api_key
@@ -921,7 +1074,7 @@ def score_mood_match_semantic(overview: str, mood: str) -> float:
     # Clamp between 0.0 and 1.0
     return max(0.0, min(1.0, final_score))
 
-def apply_mood_to_score(base_score: float, tv_genres: List[int], overview: str, mood: str) -> float:
+def apply_mood_to_score(base_score: float, tv_genres: List[int], overview: str, mood: Optional[str]) -> float:
     """
     Apply mood-based adjustments to the base score (Opzione A + C combined).
     
@@ -929,7 +1082,7 @@ def apply_mood_to_score(base_score: float, tv_genres: List[int], overview: str, 
         base_score: The base score before mood adjustment
         tv_genres: List of genre IDs for the series
         overview: Series overview/description for semantic matching
-        mood: User's mood preference
+        mood: User's mood preference (optional)
         
     Returns:
         float: Adjusted score after mood considerations
@@ -1218,14 +1371,14 @@ def _add_randomness(base_score, randomness_factor=0.15):
     return base_score + variation
 
 @tool
-def suggest_series(genre: Optional[str], mood: str, duration: Optional[str],
+def suggest_series(genre: Optional[str], mood: Optional[str], duration: Optional[str],
                    providers_text: str, language: str, country: str) -> str:
     """
     Return up to 3 series tailored to user slots and country (watchable on owned providers).
     
     Args:
         genre: Comma-separated genre names or None (e.g., "sci-fi,mystery" or "comedy")
-        mood: User's mood preference
+        mood: User's mood preference (optional)
         duration: Episode duration preference (optional, not used anymore)
         providers_text: Streaming providers
         language: Language preference
@@ -1256,7 +1409,7 @@ def suggest_series(genre: Optional[str], mood: str, duration: Optional[str],
             params["with_watch_providers"] = "|".join(str(x) for x in owned_ids)
         
         logger.info(f"Querying TMDB with params: {params}")
-        candidates = tmdb.discover_tv(params)[:12]
+        candidates = tmdb.discover_tv(params)[:MAX_CANDIDATES]
         logger.info(f"Found {len(candidates)} candidate series")
     except requests.RequestException as e:
         logger.error(f"TMDB API error: {str(e)}")
@@ -1345,9 +1498,9 @@ def suggest_series(genre: Optional[str], mood: str, duration: Optional[str],
             f"Rating: {c['vote']:.1f}]"
         )
     
-    # Take top 3 and remove scoring metadata
+    # Take top N and remove scoring metadata
     suggestions = []
-    for candidate in scored_candidates[:3]:
+    for candidate in scored_candidates[:TOP_SUGGESTIONS]:
         suggestions.append({
             "title": candidate["title"],
             "overview": candidate["overview"],
@@ -1473,14 +1626,34 @@ def get_show_info(show_name: str, country: str, providers_text: Optional[str] = 
 # =========================
 # LLM + LCEL components
 # =========================
-llm_kwargs = {
-    "openai_api_base": OVH_BASE, 
-    "openai_api_key": OVH_KEY, 
-    "temperature": 0.0,  # Use 0 for more deterministic extraction
-    "model": MODEL or "gpt-oss-120b"  # Use the actual model name available on this endpoint
-}
+# Create separate LLM instances for different purposes with appropriate temperatures
 
-llm_base = ChatOpenAI(**llm_kwargs)
+# Deterministic LLM for slot extraction
+llm_extract = ChatOpenAI(
+    base_url=OVH_BASE,
+    api_key=OVH_KEY,
+    temperature=TEMP_EXTRACT,  # Deterministic for structured extraction
+    model=MODEL or "gpt-oss-120b"
+)
+
+# Creative LLM for response generation
+llm_creative = ChatOpenAI(
+    base_url=OVH_BASE,
+    api_key=OVH_KEY,
+    temperature=TEMP_CREATIVE,  # More creative for natural responses
+    model=MODEL or "gpt-oss-120b"
+)
+
+# Balanced LLM for classification/validation
+llm_classify = ChatOpenAI(
+    base_url=OVH_BASE,
+    api_key=OVH_KEY,
+    temperature=TEMP_CLASSIFY,  # Balanced for classification tasks
+    model=MODEL or "gpt-oss-120b"
+)
+
+# Legacy alias for backward compatibility (use llm_extract for slot-filling)
+llm_base = llm_extract
 
 # 1) Chain LCEL: slot extraction/validation (structured output)
 collect_prompt = ChatPromptTemplate.from_messages([
@@ -1491,7 +1664,7 @@ collect_prompt = ChatPromptTemplate.from_messages([
      "WHAT YOU NEED TO KNOW:\n"
      "- Genre(s): {genres} (users can choose ONE or MULTIPLE genres, like 'sci-fi and mystery' or just 'comedy')\n"
      "- Mood/Tone: {moods}\n"
-     "- Language: {langs}\n"
+     "- Language: {langs} (OR 'any' if they don't have a preference)\n"
      "- Streaming Services: (any service like Netflix, Prime Video, Disney+, etc.)\n\n"
      
      "WHAT YOU ALREADY KNOW:\n"
@@ -1504,10 +1677,11 @@ collect_prompt = ChatPromptTemplate.from_messages([
      "1. **Extract everything** from the user's message in one go - read carefully!\n"
      "2. **Multiple genres are OK** - If user says 'sci-fi and mystery' or 'comedy, drama', extract as a comma-separated list\n"
      "3. **Be permissive with genres** - Extract ANY genre-related words (even if not in the list above). The system will map them intelligently (e.g., 'horror' → 'mystery, thriller')\n"
-     "4. **Keep what you know** - Don't change fields that are already filled unless the user explicitly wants to change them.\n"
-     "5. **Be natural** - If something's missing, ask ONE simple question. Be conversational, friendly, and brief (1-2 sentences max).\n"
-     "6. **Don't repeat yourself** - NEVER ask about information you already have (check WHAT YOU ALREADY KNOW above).\n"
-     "7. **Know when you're done** - Once you have all 4 required fields (genre, mood, providers, language), set ask_next to null.\n\n"
+     "4. **Be permissive with language** - If user says 'any language', 'any will be fine', 'doesn't matter', or 'no preference', extract as 'any'\n"
+     "5. **Keep what you know** - Don't change fields that are already filled unless the user explicitly wants to change them.\n"
+     "6. **Be natural** - If something's missing, ask ONE simple question. Be conversational, friendly, and brief (1-2 sentences max).\n"
+     "7. **Don't repeat yourself** - NEVER ask about information you already have (check WHAT YOU ALREADY KNOW above).\n"
+     "8. **Know when you're done** - Once you have all 4 required fields (genre, mood, providers, language), set ask_next to null.\n\n"
      
      "EXAMPLES OF NATURAL QUESTIONS (do NOT list options!):\n"
      "- Missing genre: \"What kind of genre are you in the mood for? You can choose one or more!\"\n"
@@ -1554,7 +1728,7 @@ final_prompt = ChatPromptTemplate.from_messages([
      "Style: concise, friendly, helpful. Respond in {language}."),
     ("human", "User preferences: {prefs}\nSuggestions (JSON): {suggestions}\nLocation: {geo}")
 ])
-final_chain = final_prompt | llm_base
+final_chain = final_prompt | llm_creative  # Use creative LLM for responses
 
 # =========================
 # Runtime CLI
@@ -1567,6 +1741,10 @@ def normalize_user_input(user_input: str) -> str:
     # When user says these in isolation, treat as "any language" (most common missing field)
     if re.match(r'^(no|nope|nah|don\'t care|doesn\'t matter|whatever|surprise me)$', text, re.IGNORECASE):
         text = "any language"
+    
+    # Handle "any will/would be fine/good/ok" variations
+    if re.search(r'\bany\s+(will|would)\s+be\s+(fine|good|ok|okay|great)\b', text, re.IGNORECASE):
+        text = re.sub(r'\bany\s+(will|would)\s+be\s+(fine|good|ok|okay|great)\b', 'any language', text, flags=re.IGNORECASE)
     
     # Handle explicit "any" -> "any language" (before other "any" replacements)
     if text.lower() == "any":
@@ -1638,58 +1816,300 @@ class APIError(Exception):
 # =========================
 def should_search(state: ConversationState) -> Literal["search", "collect", "end"]:
     """Router: decide if we should search or keep collecting."""
-    user_input = state["user_input"].lower().strip()
+    user_input = state.get("user_input", "").lower().strip()
+    
+    # If no input yet (initial greeting), end and wait for user
+    if not user_input:
+        return "end"
     
     # Check for exit commands
     if user_input in {"exit", "quit", "bye", "goodbye"}:
         return "end"
     
+    # Check for new search request
+    if user_input == "new":
+        return "end"
+    
     # Check if preferences are complete or user wants to search
-    if state["prefs_complete"] or user_input == "search":
+    if state["prefs_complete"] or user_input in {"search", "go", "find"}:
         return "search"
     
-    return "collect"
+    # After processing input once, always end to wait for next user input
+    # Don't loop back to collect - let main loop handle that
+    return "end"
 
 def should_continue(state: ConversationState) -> Literal["feedback", "collect", "end"]:
-    """Router: after search, go to feedback or continue."""
-    user_input = state["user_input"].lower().strip()
+    """Router: after search/feedback, decide next step."""
+    user_input = state.get("user_input", "").lower().strip()
     
+    # Check for exit
     if user_input in {"exit", "quit", "bye", "goodbye"}:
         return "end"
     
-    if state["waiting_for_feedback"]:
-        return "feedback"
+    # Check for new search
+    if user_input == "new":
+        return "end"
     
+    # Always end after processing to wait for next user input
+    return "end"
+
+def router_entry(state: ConversationState) -> ConversationState:
+    """Entry router to direct to the right node based on state."""
+    # Just pass through - routing is done by should_route_entry
+    return state
+
+def should_route_entry(state: ConversationState) -> Literal["feedback", "collect"]:
+    """Router from entry point."""
+    # If waiting for feedback, go to feedback node
+    if state.get("waiting_for_feedback"):
+        return "feedback"
+    # Otherwise go to collecting
     return "collect"
 
 def greeting_node(state: ConversationState) -> ConversationState:
-    """Initial greeting node."""
-    state["next_question"] = (
-        "Hi! 👋 What kind of TV series are you looking for?\n"
-        "(Tell me about genre, mood, duration, platforms, or language)"
-    )
+    """Initial greeting node - display welcome message only once."""
+    # Only show greeting if this is the first turn
+    if state["conversation_turn"] == 0:
+        print("🍿 SerieBot — Geo-located TV Suggestions (OVH + LangChain + ipinfo + TMDB)")
+        print("Type 'exit' to quit, 'new' to start over, or 'search' to search with current preferences.\n")
+        
+        print("Hi! 👋 What kind of TV series are you looking for?")
+        print("You can tell me about genre, mood, language, or platforms (e.g., Netflix, Prime)...")
+    
     state["current_state"] = "collecting"
     return state
 
 def collecting_node(state: ConversationState) -> ConversationState:
-    """Node for collecting user preferences."""
-    logger.info("Collecting preferences node activated")
-    # This will be handled by BotSession.extract_preferences()
+    """Node for collecting user preferences using slot-filling extraction."""
+    logger.info(f"Collecting preferences - Turn {state['conversation_turn']}")
+    
+    user_input = state.get("user_input", "")
+    
+    # Skip if no input (first greeting)
+    if not user_input:
+        state["current_state"] = "collecting"
+        return state
+    
+    bot = state["bot"]
+    
+    # Check for show-specific questions BEFORE extraction
+    if bot._is_show_question(user_input):
+        logger.info("Detected show-specific question")
+        bot.answer_show_question(user_input)
+        state["current_state"] = "collecting"
+        return state
+    
+    # Check for informational questions BEFORE extraction
+    if bot.is_informational_question(user_input):
+        logger.info("Detected informational question")
+        bot.answer_informational_question(user_input)
+        state["current_state"] = "collecting"
+        return state
+    
+    # Check if input is off-topic BEFORE extraction
+    if bot.is_off_topic(user_input, state.get("last_ask_next") or ""):
+        logger.warning(f"Off-topic input detected: {user_input}")
+        help_msg = bot.get_contextual_help_message()
+        print(f"\nai> I appreciate you talking to me, but I specialize in TV series recommendations! 😊\n")
+        print(f"{help_msg}\n")
+        state["current_state"] = "collecting"
+        return state
+    
+    # Check for force search intent using LLM-based detection
+    current_prefs = {
+        "genre": state["prefs"].genre,
+        "mood": state["prefs"].mood,
+        "providers": state["prefs"].providers,
+        "language": state["prefs"].language
+    }
+    
+    if detect_force_search_intent(user_input, current_prefs):
+        state["is_force_search"] = True
+        logger.info("LLM detected force search intent")
+    
+    # Extract preferences and get mapping info
+    # Store prefs BEFORE extraction to detect what changed
+    prefs_before = bot.prefs.model_dump()
+    
+    ask_next, mapping_info = bot.extract_preferences(user_input)
+    
+    # Update bot's prefs to state
+    state["prefs"] = bot.prefs
+    prefs_after = bot.prefs.model_dump()
+    
+    # Build "Got it!" message showing what was JUST extracted (changed)
+    extracted_items = []
+    
+    for field, value_after in prefs_after.items():
+        value_before = prefs_before.get(field)
+        # If value changed and is not None, it was just extracted
+        if value_after != value_before and value_after is not None and field != 'duration':
+            # Format the value nicely
+            if isinstance(value_after, list):
+                formatted_value = ', '.join(value_after)
+            else:
+                formatted_value = str(value_after)
+            
+            # Map to user-friendly names
+            field_names = {
+                'genre': 'Genre',
+                'mood': 'Mood',
+                'providers': 'Platforms',
+                'language': 'Language'
+            }
+            friendly_name = field_names.get(field, field)
+            extracted_items.append(f"{friendly_name}: {formatted_value}")
+    
+    # Show "Got it!" if something was extracted
+    if extracted_items:
+        print(f"\nai> Got it! {', '.join(extracted_items)}")
+    
+    # Display any LLM mapping feedback to user
+    if mapping_info:
+        for field, info in mapping_info.items():
+            if 'mapped' in info:
+                orig = info['original']
+                mapped = info['mapped']
+                if isinstance(orig, list):
+                    orig_str = ', '.join(orig)
+                else:
+                    orig_str = orig
+                if isinstance(mapped, list):
+                    mapped_str = ', '.join(mapped)
+                else:
+                    mapped_str = mapped
+                print(f"💡 I mapped '{orig_str}' to: {mapped_str}")
+    
+    # Update state
+    state["next_question"] = ask_next
+    state["last_ask_next"] = ask_next
+    state["conversation_turn"] += 1
+    
+    # Check if preferences are complete
+    state["prefs_complete"] = (
+        state["prefs"].genre is not None and
+        state["prefs"].mood is not None and
+        state["prefs"].providers is not None and
+        state["prefs"].language is not None
+    ) or state["is_force_search"]
+    
+    # Detect repeat loops
+    if ask_next == state.get("last_ask_next") and ask_next is not None:
+        state["repeat_count"] += 1
+        if state["repeat_count"] >= MAX_REPEATS:
+            # Show contextual help
+            print(f"\nai> I notice we're going in circles. Let me help! 🔄\n")
+            # Provide examples based on what's missing
+            if not state["prefs"].genre:
+                print("📺 For genre, try: 'sci-fi', 'comedy', 'drama', 'mystery', 'action'")
+            if not state["prefs"].mood:
+                print("🎭 For mood, try: 'light-hearted', 'intense', 'comforting', 'adrenaline-fueled'")
+            if not state["prefs"].providers:
+                print("📺 For platforms, try: 'Netflix', 'Prime Video', 'Disney+', 'Apple TV+'")
+            if not state["prefs"].language:
+                print("🌍 For language, try: 'English', 'Italian', 'Spanish', 'any language'")
+            print()
+            state["repeat_count"] = 0
+    else:
+        state["repeat_count"] = 0
+    
+    # Print next question if not complete
+    if not state["prefs_complete"] and ask_next:
+        print(f"\nai> {ask_next}")
+    
     state["current_state"] = "collecting"
     return state
 
 def searching_node(state: ConversationState) -> ConversationState:
-    """Node for performing TMDB search."""
+    """Node for performing TMDB search and displaying results."""
     logger.info("Searching node activated")
-    # This will be handled by BotSession.suggest_series()
-    state["current_state"] = "searching"
+    
+    bot = state["bot"]
+    prefs = state["prefs"]
+    
+    # Get geo location if not cached
+    if state["geo_cache"] is None:
+        try:
+            geo_res = ipinfo_location.invoke({})
+            geo_data = json.loads(geo_res)
+            state["geo_cache"] = geo_data
+        except Exception as e:
+            logger.error(f"Failed to get location: {e}")
+            state["geo_cache"] = {"country": "US"}
+    
+    country = state["geo_cache"].get("country", "US")
+    
+    # Prepare parameters for suggest_series tool
+    genre_str = ', '.join(prefs.genre) if prefs.genre else None
+    providers_str = ', '.join(prefs.providers) if prefs.providers else None
+    
+    print("\n📍 Searching for recommendations...")
+    
+    try:
+        # Call the suggest_series tool
+        result_json = suggest_series.invoke({
+            "genre": genre_str,
+            "mood": prefs.mood,
+            "duration": prefs.duration,
+            "providers_text": providers_str,
+            "language": prefs.language,
+            "country": country
+        })
+        
+        result = json.loads(result_json)
+        
+        if "error" in result:
+            print(f"\nai> {result['error']}")
+            state["last_suggestions_count"] = 0
+        else:
+            suggestions = result.get("suggestions", [])
+            state["last_suggestions_count"] = len(suggestions)
+            state["last_suggestions"] = suggestions
+            
+            # Display suggestions
+            print("\n🎬 Here are my top suggestions:\n")
+            for i, show in enumerate(suggestions, 1):
+                print(f"{i}. {show['title']} ({show.get('first_air_date', 'N/A')})")
+                print(f"   ⭐ {show['vote']}/10")
+                print(f"   📝 {show['overview']}")
+                if show.get('where'):
+                    print(f"   📺 Available on: {show['where']}")
+                print()
+            
+            # Show feedback prompt
+            print("How do these look? Please rate:")
+            print("• 👍 (or type 'good', 'like', 'yes') if you liked them")
+            print("• 👎 (or type 'bad', 'dislike', 'no') if you didn't")
+            print("• 'skip' to skip feedback")
+            print("Or refine your search (e.g., 'change genre to comedy', 'only Netflix')")
+            print("Type 'new' to start over or 'exit' to quit")
+            
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        print(f"\nai> Sorry, search failed: {str(e)}")
+        state["last_suggestions_count"] = 0
+    
     state["waiting_for_feedback"] = True
+    state["current_state"] = "searching"
+    
     return state
 
 def feedback_node(state: ConversationState) -> ConversationState:
-    """Node for handling feedback."""
+    """Node for handling user feedback on suggestions."""
     logger.info("Feedback node activated")
-    # This will be handled by BotSession.handle_feedback()
+    
+    bot = state["bot"]
+    user_input = state["user_input"]
+    
+    # Use BotSession's feedback handler
+    handled, next_q = bot.handle_feedback(user_input)
+    
+    if handled:
+        state["waiting_for_feedback"] = bot.waiting_for_feedback
+        if next_q:
+            print(f"\nai> {next_q}")
+            state["next_question"] = next_q
+    
     state["current_state"] = "feedback"
     return state
 
@@ -2067,7 +2487,7 @@ class BotSession:
                 ("human", "{question}")
             ])
             
-            answer_chain = question_prompt | llm_base
+            answer_chain = question_prompt | llm_creative  # Use creative LLM
             
             # Stream the response token by token
             print("ai> ", end="", flush=True)
@@ -2166,7 +2586,7 @@ class BotSession:
                 ("human", "{user_input}")
             ])
             
-            classifier_chain = off_topic_prompt | llm_base
+            classifier_chain = off_topic_prompt | llm_classify  # Use classifier LLM
             result = classifier_chain.invoke({
                 "user_input": user_input,
                 "context": context_info
@@ -2295,7 +2715,7 @@ class BotSession:
                     current_providers=self.prefs.providers or "null",
                     current_language=self.prefs.language or "null"
                 )
-                | llm_base
+                | llm_extract  # Use deterministic extraction LLM
                 | collect_parser
             )
             
@@ -2439,7 +2859,7 @@ class BotSession:
             if ask_next == self.last_ask_next and ask_next is not None:
                 self.repeat_count += 1
                 logger.warning(f"Same question repeated {self.repeat_count} times")
-                if self.repeat_count >= 3:
+                if self.repeat_count >= MAX_REPEATS:
                     logger.error("Too many repeats detected, showing contextual help")
                     help_msg = self.get_contextual_help_message()
                     print(f"\nai> I notice we're going in circles. Let me help! 🔄\n")
@@ -2622,6 +3042,7 @@ def build_conversation_graph():
     
     States:
     - greeting: Initial welcome
+    - router_entry: Routes to collecting or feedback based on state
     - collecting: Collecting user preferences
     - searching: Performing TMDB search
     - feedback: Collecting user feedback
@@ -2634,6 +3055,7 @@ def build_conversation_graph():
     
     # Add nodes
     workflow.add_node("greeting", greeting_node)
+    workflow.add_node("router_entry", router_entry)
     workflow.add_node("collecting", collecting_node)
     workflow.add_node("searching", searching_node)
     workflow.add_node("feedback", feedback_node)
@@ -2646,6 +3068,16 @@ def build_conversation_graph():
         "greeting",
         lambda state: "collecting",
         {"collecting": "collecting"}
+    )
+    
+    # Route from router_entry based on waiting_for_feedback
+    workflow.add_conditional_edges(
+        "router_entry",
+        should_route_entry,
+        {
+            "feedback": "feedback",
+            "collect": "collecting"
+        }
     )
     
     workflow.add_conditional_edges(
@@ -2678,22 +3110,151 @@ def build_conversation_graph():
         }
     )
     
-    # Compile the graph with memory
-    memory = MemorySaver()
-    app = workflow.compile(checkpointer=memory)
+    # Compile the graph WITHOUT memory (BotSession is not serializable)
+    # Memory is managed through the BotSession instance passed in state
+    app = workflow.compile()
     
     logger.info("LangGraph conversation flow built successfully")
     return app
 
+def run_graph_cli():
+    """Main entry point using LangGraph for conversation flow."""
+    logger.info("Starting LangGraph CLI interface")
+    
+    # Build the graph
+    app = build_conversation_graph()
+    
+    # Build a separate entry app that starts from router_entry
+    entry_workflow = StateGraph(ConversationState)
+    entry_workflow.add_node("router_entry", router_entry)
+    entry_workflow.add_node("collecting", collecting_node)
+    entry_workflow.add_node("searching", searching_node)
+    entry_workflow.add_node("feedback", feedback_node)
+    
+    entry_workflow.add_edge(START, "router_entry")
+    
+    entry_workflow.add_conditional_edges(
+        "router_entry",
+        should_route_entry,
+        {
+            "feedback": "feedback",
+            "collect": "collecting"
+        }
+    )
+    
+    entry_workflow.add_conditional_edges(
+        "collecting",
+        should_search,
+        {
+            "search": "searching",
+            "collect": "collecting",
+            "end": END
+        }
+    )
+    
+    entry_workflow.add_conditional_edges(
+        "searching",
+        should_continue,
+        {
+            "feedback": "feedback",
+            "collect": "collecting",
+            "end": END
+        }
+    )
+    
+    entry_workflow.add_conditional_edges(
+        "feedback",
+        should_continue,
+        {
+            "feedback": "feedback",
+            "collect": "collecting",
+            "end": END
+        }
+    )
+    
+    entry_app = entry_workflow.compile()
+    
+    # Initialize bot session and state
+    bot = BotSession()
+    
+    # Initial state
+    state: ConversationState = {
+        "bot": bot,
+        "prefs": bot.prefs,
+        "session_id": bot.session_id,
+        "user_input": "",
+        "next_question": None,
+        "last_ask_next": None,
+        "repeat_count": 0,
+        "conversation_turn": 0,
+        "geo_cache": None,
+        "last_suggestions_count": 0,
+        "last_suggestions": None,
+        "waiting_for_feedback": False,
+        "prefs_complete": False,
+        "is_force_search": False,
+        "current_state": "greeting"
+    }
+    
+    # Show greeting ONCE using full app
+    state = app.invoke(state)
+    
+    # Main conversation loop using entry_app
+    while True:
+        try:
+            # Get user input
+            user_input = input("\n> ").strip()
+            
+            if not user_input:
+                continue
+            
+            # Update state with user input
+            state["user_input"] = user_input
+            
+            # Check for exit
+            if user_input.lower() in {"exit", "quit", "bye", "goodbye"}:
+                print("\nGoodbye! 👋\n")
+                break
+            
+            # Check for reset
+            if user_input.lower() == "new":
+                bot.reset()
+                state["prefs"] = bot.prefs
+                state["repeat_count"] = 0
+                state["conversation_turn"] = 0
+                state["waiting_for_feedback"] = False
+                state["prefs_complete"] = False
+                state["is_force_search"] = False
+                print("\nai> Starting fresh! What are you looking for?")
+                continue
+            
+            # Invoke entry app (routes to feedback or collecting based on waiting_for_feedback)
+            state = entry_app.invoke(state)
+            
+            # Sync bot state back to state dict AND update bot's internal state
+            state["prefs"] = bot.prefs
+            bot.waiting_for_feedback = state.get("waiting_for_feedback", False)
+            state["waiting_for_feedback"] = bot.waiting_for_feedback
+            state["geo_cache"] = bot.geo_cache if bot.geo_cache else state.get("geo_cache")
+            state["last_suggestions_count"] = bot.last_suggestions_count
+            
+        except KeyboardInterrupt:
+            print("\n\nGoodbye! 👋")
+            break
+        except Exception as e:
+            logger.error(f"Error in conversation loop: {e}", exc_info=True)
+            print(f"\nai> Sorry, something went wrong: {e}\n")
+
 def run_cli():
-    """Main entry point for the CLI application."""
-    logger.info("Starting CLI interface")
+    """Main entry point for the CLI application (legacy)."""
+    logger.info("Starting CLI interface (legacy mode)")
     session = BotSession()
     session.run()
 
 if __name__ == "__main__":
     try:
-        run_cli()
+        # Use LangGraph version
+        run_graph_cli()
     except KeyboardInterrupt:
         logger.info("Application interrupted by user (Ctrl+C)")
         print("\n\nGoodbye! 👋")
