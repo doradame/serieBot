@@ -7,6 +7,10 @@ A sophisticated TV series recommendation chatbot powered by **LangChain 1.0**, *
 ### Core Functionality
 - **Natural Conversation Flow**: Engages users in a friendly dialogue to understand their preferences
 - **Intelligent Genre Matching**: Advanced scoring system that prioritizes content most relevant to user requests
+- **Smart Off-Topic Handling**: LLM-powered natural responses when users go off-topic, gently redirecting to TV recommendations
+- **Instant Feedback**: "Got it!" confirmations for each extracted preference to keep users informed
+- **Agentic Force Search**: Detects when users want to skip remaining questions and search immediately
+- **Show-Specific Questions**: Distinguishes questions about specific series from general preference gathering
 - **Freshness Bonus**: Promotes newer series to diversify suggestions and avoid repetitive recommendations
 - **Geographic Awareness**: Automatically detects your location and filters by available streaming providers
 - **Multi-platform Support**: Works with Netflix, Prime Video, Disney+, Apple TV+, HBO Max, and many others
@@ -14,8 +18,9 @@ A sophisticated TV series recommendation chatbot powered by **LangChain 1.0**, *
 
 ### LangChain 1.0 Innovations ✨
 - **Streaming Responses**: Real-time token-by-token response generation for better UX
-- **LangGraph State Management**: Structured conversation flow with automatic state transitions
-- **Memory Checkpointing**: Persistent conversation state with rollback capability
+- **LangGraph State Management**: Dual-workflow architecture with intelligent routing for complex conversation flows
+- **Multi-Temperature LLM Strategy**: Three specialized LLM instances (deterministic extraction, creative responses, classification)
+- **LLM-Powered Validations**: Intelligent normalization of genres, moods, languages, and providers using AI
 - **Modular Architecture**: Clean separation of concerns with testable components
 - **Comprehensive Logging**: Detailed logging for debugging and monitoring
 
@@ -27,28 +32,77 @@ SerieBot leverages **LangChain 1.0** and **LangGraph** to build a robust, mainta
 
 ### 1. LangGraph Conversation Flow 🗺️
 
-The bot uses **LangGraph** to manage conversation states with clear transitions:
+The bot uses **LangGraph** with a **dual-workflow architecture** to manage complex conversation states:
 
 ```
-START → greeting → collecting ⇄ searching → feedback → END
-                      ↓
-                    exit
+Main Flow (First Time):
+START → greeting → router_entry → collecting → searching → feedback → END
+
+Re-entry Flow (After Feedback):
+START → router_entry → [collecting | feedback]
+            ↓              ↓
+         collecting    feedback
+            ↓              ↓
+        searching ←-------┘
+            ↓
+          END
 ```
+
+**Architecture Details:**
+- **Two separate LangGraph apps**: `app` (main flow) and `entry_app` (re-entry after feedback)
+- **`router_entry` node**: Smart router that decides whether to go to `collecting` or `feedback` based on `waiting_for_feedback` state
+- This dual-app design elegantly handles the feedback loop without creating circular dependencies
 
 **States:**
 - `greeting`: Welcome message and initial setup
-- `collecting`: Gathering user preferences (genre, mood, duration, platforms, language)
-- `searching`: Executing TMDB search with geo-filtering
-- `feedback`: Collecting user feedback (👍/👎)
+- `router_entry`: **[KEY]** Routes between collecting and feedback based on conversation state
+- `collecting`: Gathering user preferences (genre, mood, platforms, language) with instant "Got it!" confirmations
+- `searching`: Executing TMDB search with geo-filtering and intelligent scoring
+- `feedback`: Collecting user feedback (👍/👎) with option to search again
 - `end`: Graceful termination
 
 **Benefits:**
 - 🧩 Modular design - each state is isolated and testable
 - 🔄 Easy to extend - add new conversation paths without breaking existing logic
-- 💾 Automatic checkpointing - conversation state persists across sessions
+- 🎯 Smart routing - `router_entry` eliminates circular dependencies
+- 🔁 Feedback loop - seamlessly handles multiple search iterations
 - 📊 Visual debugging - graph structure is self-documenting
 
-### 2. Streaming Responses 🌊
+### 2. Multi-Temperature LLM Strategy 🎯
+
+SerieBot uses **three specialized LLM instances** with different temperature settings for different tasks:
+
+```python
+# Deterministic extraction (temperature: 0.0)
+llm_extract = ChatOpenAI(
+    temperature=0.0,  # No randomness for structured data extraction
+    model="gpt-oss-120b"
+)
+
+# Creative responses (temperature: 0.7)
+llm_creative = ChatOpenAI(
+    temperature=0.7,  # Natural, varied responses for user interactions
+    model="gpt-oss-120b"
+)
+
+# Classification tasks (temperature: 0.3)
+llm_classify = ChatOpenAI(
+    temperature=0.3,  # Balanced for validation and categorization
+    model="gpt-oss-120b"
+)
+```
+
+**Usage:**
+- **`llm_extract`**: Preference extraction, structured output parsing
+- **`llm_creative`**: Off-topic responses, natural language generation
+- **`llm_classify`**: Genre/mood/language/provider normalization, intent detection
+
+This multi-temperature strategy ensures:
+- Consistent, reliable data extraction
+- Natural, engaging user interactions
+- Accurate classification without over-creativity
+
+### 3. Streaming Responses 🌊
 
 All LLM responses now stream token-by-token for better user experience:
 
@@ -60,7 +114,7 @@ for chunk in chain.stream(input):
 
 Users see the bot "thinking" in real-time, creating a more interactive experience.
 
-### 3. Orchestrating the Logic (LCEL) 🔗
+### 4. Orchestrating the Logic (LCEL) 🔗
 
 The bot uses **LangChain Expression Language (LCEL)** to create powerful chains using the `|` (pipe) symbol.
 
@@ -77,35 +131,95 @@ collect_chain = (
         current_mood=self.prefs.mood or "null",
         # ... other context
     )
-    | llm_base
+    | llm_extract  # Uses deterministic LLM (temp=0.0)
     | collect_parser
 )
 ```
 
 **What's happening here:**
 1. `collect_prompt.partial(...)` injects dynamic context (available options, current state)
-2. `| llm_base` sends the prompt to the AI model
+2. `| llm_extract` sends the prompt to the deterministic AI model (temp=0.0)
 3. `| collect_parser` transforms the LLM's text output into a structured Python object
+
+#### **Off-Topic Response Chain**
+When users go off-topic, a creative LLM generates natural redirections:
+
+```python
+redirect_chain = redirect_prompt | llm_creative  # Uses creative LLM (temp=0.7)
+for chunk in redirect_chain.stream({"user_input": user_input}):
+    print(chunk.content, end="", flush=True)
+```
+
+**Example outputs:**
+- User: "what's the weather?" → Bot: "I wish I could check the weather for you! 😊 But I'm here to help you discover great TV series. What kind of genre are you in the mood for?"
+- User: "tell me a joke" → Bot: "I'm great at sharing laughs, but my specialty is TV show recommendations! 😄"
 
 #### **Final Response Chain**
 A simpler chain that takes the search results and user preferences, formats them into a prompt, and generates a friendly, natural response.
 
 ```python
-final_chain = final_prompt | llm_base
+final_chain = final_prompt | llm_creative  # Natural language generation
 ```
 
 This orchestration makes the code **declarative and easy to read**. You're defining the **flow of data** rather than writing complex procedural code with nested if-statements and error handling.
 
 ---
 
-### 2. Structuring Communication with the LLM 🤖
+### 5. LLM-Powered Intelligent Validations 🧠
+
+SerieBot uses LLMs not just for conversation, but also for **smart data normalization and validation**:
+
+#### **Genre Validation**
+```python
+def validate_genre_llm(user_genres: List[str]) -> List[str]:
+    """Maps user input to canonical TMDB genres, handling typos and synonyms."""
+    # User: "sifi and funny" → LLM: ["sci-fi", "comedy"]
+    # User: "space opera" → LLM: ["sci-fi", "action & adventure"]
+```
+
+#### **Mood Validation**
+```python
+def validate_mood_llm(user_mood: str) -> Optional[str]:
+    """Maps mood descriptions to canonical categories."""
+    # User: "relaxing" → LLM: "comforting"
+    # User: "dark and gritty" → LLM: "intense"
+```
+
+#### **Language Validation**
+```python
+def validate_language_llm(user_language: str) -> Optional[str]:
+    """Intelligently handles language preferences."""
+    # User: "any will be fine" → LLM: "any"
+    # User: "doesn't matter" → LLM: "any"
+    # User: "italiano" → LLM: "it"
+```
+
+#### **Provider Normalization**
+```python
+def normalize_providers_llm(user_text: str) -> List[str]:
+    """Handles typos, abbreviations, and informal names."""
+    # User: "Netfix and D+" → LLM: ["Netflix", "Disney+"]
+    # User: "prime video" → LLM: ["Prime Video"]
+```
+
+**Benefits:**
+- 🎯 Handles typos gracefully ("Netfix" → "Netflix")
+- 🗣️ Understands natural language ("any will be fine" → "any")
+- 🔄 Maps synonyms ("funny" → "comedy", "relaxing" → "comforting")
+- 🌍 Recognizes variations ("italiano" → "it")
+
+This turns the bot from a rigid keyword matcher into an **intelligent conversational assistant**.
+
+---
+
+### 6. Structuring Communication with the LLM 🤖
 
 This is perhaps the **most critical role** of LangChain in SerieBot. LLMs naturally produce unstructured text, which is hard for a program to work with. LangChain solves this in two powerful ways:
 
 #### **ChatPromptTemplate: Dynamic Context Injection**
 
 Instead of sending static strings to the LLM, `ChatPromptTemplate` allows you to create complex and dynamic prompts. You programmatically inject:
-- The list of allowed genres, moods, durations, languages
+- The list of allowed genres, moods, languages
 - The **current state of the conversation** (what you already know)
 - Context about what's missing and what to ask next
 
@@ -116,7 +230,6 @@ collect_prompt = ChatPromptTemplate.from_messages([
      "WHAT YOU ALREADY KNOW:\n"
      "- Genre: {current_genre}\n"
      "- Mood: {current_mood}\n"
-     "- Duration: {current_duration}\n"
      # ... the LLM gets perfect context every time
     ),
     ("human", "{user_input}")
@@ -146,7 +259,7 @@ This is what transforms an LLM from a "chatbot" into a **reliable component** of
 
 ---
 
-### 3. Defining Tools for the AI 🛠️
+### 7. Defining Tools for the AI 🛠️
 
 The `@tool` decorator labels Python functions as tools that can be used by LangChain agents:
 
@@ -157,8 +270,13 @@ def ipinfo_location() -> str:
     # Implementation...
 
 @tool
-def suggest_series(genre: str, mood: str, duration: str, ...) -> str:
+def suggest_series(genre: str, mood: str, ...) -> str:
     """Return up to 3 series tailored to user preferences."""
+    # Implementation...
+
+@tool
+def get_show_info(show_name: str, country: str, ...) -> str:
+    """Get detailed information about a specific TV show."""
     # Implementation...
 ```
 
@@ -172,17 +290,37 @@ def suggest_series(genre: str, mood: str, duration: str, ...) -> str:
 Instead of manually calling `ipinfo_location()` and `suggest_series()`, you could upgrade to an agent that automatically decides:
 > "The user wants recommendations → I need their location → call `ipinfo_location` → now I need series data → call `suggest_series` with the extracted preferences"
 
+**Current Implementation:**
+The bot already demonstrates intelligent tool selection by detecting when users ask about specific shows:
+- Generic question: "I want sci-fi" → Uses `suggest_series` for recommendations
+- Specific question: "Tell me about Breaking Bad" → Uses `get_show_info` for details
+
 ---
 
-### 4. Abstracting the Model Connection 🔌
+### 8. Abstracting the Model Connection 🔌
 
 `ChatOpenAI` provides a standardized, high-level interface for connecting to AI models:
 
 ```python
-llm_base = ChatOpenAI(
-    openai_api_base=OVH_BASE,  # OVH AI Endpoints
-    openai_api_key=OVH_KEY,
-    temperature=0.0,            # Deterministic extraction
+# Three specialized instances with different temperatures
+llm_extract = ChatOpenAI(
+    base_url=OVH_BASE,
+    api_key=OVH_KEY,
+    temperature=0.0,  # Deterministic
+    model="gpt-oss-120b"
+)
+
+llm_creative = ChatOpenAI(
+    base_url=OVH_BASE,
+    api_key=OVH_KEY,
+    temperature=0.7,  # Creative
+    model="gpt-oss-120b"
+)
+
+llm_classify = ChatOpenAI(
+    base_url=OVH_BASE,
+    api_key=OVH_KEY,
+    temperature=0.3,  # Balanced
     model="gpt-oss-120b"
 )
 ```
@@ -391,10 +529,9 @@ You should see:
 ```text
 🍿 SerieBot — Geo-located TV Suggestions (OVH + LangChain + ipinfo + TMDB)
 Type 'exit' to quit, 'new' to start over, or 'search' to search with current preferences.
-💡 Tip: For duration, use '<30m' for short, '~45m' for standard, or '>60m' for long episodes.
 
 Hi! 👋 What kind of TV series are you looking for?
-You can tell me about genre, mood, duration, language, or platforms (e.g., Netflix, Prime)...
+You can tell me about genre, mood, language, or platforms (e.g., Netflix, Prime)...
 >
 ```
 
@@ -403,7 +540,7 @@ You can tell me about genre, mood, duration, language, or platforms (e.g., Netfl
 Try your first query:
 
 ```text
-> mind blowing sci-fi on netflix, any language, any duration
+> mind blowing sci-fi on netflix, any language
 
 ai> Got it! Still need: mood.
 How are you feeling today - something light or more intense?
@@ -441,7 +578,7 @@ pip install -r requirements.txt
 **Problem:** No suggestions found
 
 **Solution:** The streaming service might not be available in your region, or there might be no content matching all your filters. Try:
-- Broadening your search (e.g., remove duration filter)
+- Broadening your search (e.g., try different genres or moods)
 - Trying different providers
 - Checking if the provider name is spelled correctly
 
@@ -467,7 +604,7 @@ This returns you to your system's default Python environment.
 🍿 SerieBot — Geo-located TV Suggestions (OVH + LangChain + ipinfo + TMDB)
 
 Hi! 👋 What kind of TV series are you looking for?
-> mind blowing sci-fi on netflix, any duration, any language
+> mind blowing sci-fi on netflix, any language
 
 ai> Got it! Still need: mood.
 How are you feeling today - something light or more intense?
@@ -500,11 +637,6 @@ episodes around 45 minutes long. Available on Netflix in Italy.
 
 - **Genre**: `sci-fi`, `comedy`, `drama`, `crime`, `animation`, `fantasy`, `mystery`, `documentary`
 - **Mood**: `light-hearted`, `intense`, `mind-blowing`, `comforting`, `adrenaline-fueled`
-- **Duration**:
-  - `<30m` (short episodes)
-  - `~45m` (standard)
-  - `>60m` (long episodes)
-  - Or use natural language: `45 minutes`, `short`, `long`
 - **Language**: `en`, `it`, `any`
 - **Providers**: `Netflix`, `Prime Video`, `Disney+`, `Apple TV+`, `HBO Max`, etc.
 
@@ -528,24 +660,41 @@ serieBot/
 
 ### Key Components
 
-- **`BotSession` class**: Manages conversation state and logic
-  - `extract_preferences()`: Extracts user preferences using LCEL chain
-  - `perform_search()`: Executes TMDB search with intelligent scoring
-  - `handle_feedback()`: Processes user ratings (👍/👎)
-  - `is_informational_question()`: Distinguishes questions from search queries
+**LangGraph Nodes:**
+- `greeting_node()`: Initial welcome and setup
+- `router_entry()`: **[CRITICAL]** Smart router between collecting and feedback states
+- `collecting_node()`: Preference extraction with instant "Got it!" confirmations
+- `searching_node()`: TMDB search execution with intelligent scoring
+- `feedback_node()`: User feedback collection and loop management
 
-- **LCEL Chains**:
-  - `collect_chain`: Prompt → LLM → PydanticParser → Structured preferences
-  - `final_chain`: Prompt → LLM → Natural language response
+**BotSession Methods:**
+- `is_off_topic()`: Detects and handles off-topic inputs with natural LLM responses
+- `is_informational_question()`: Distinguishes show-specific questions from preferences
+- `handle_feedback()`: Processes user ratings (👍/👎)
+- `detect_force_search_intent()`: Identifies when users want to skip remaining questions
 
-- **Tools**:
-  - `ipinfo_location`: Geolocation detection
-  - `suggest_series`: TMDB search with scoring algorithm
+**LLM-Powered Validators:**
+- `validate_genre_llm()`: Genre normalization with typo handling
+- `validate_mood_llm()`: Mood mapping to canonical categories
+- `validate_language_llm()`: Language preference interpretation
+- `normalize_providers_llm()`: Provider name normalization
 
-- **Scoring System**:
-  - `_score_genre_match()`: Genre relevance scoring
-  - `_score_freshness()`: Recency bonus
-  - Final ranking: `(genre_score + freshness_score, rating)`
+**LCEL Chains:**
+- `collect_chain`: Prompt → llm_extract → PydanticParser → Structured preferences
+- `redirect_chain`: Prompt → llm_creative → Natural off-topic responses
+- `final_chain`: Prompt → llm_creative → Natural language summaries
+
+**Tools:**
+- `ipinfo_location`: Geolocation detection
+- `suggest_series`: TMDB search with scoring algorithm
+- `get_show_info`: Detailed information about specific shows
+
+**Scoring System:**
+- `_score_genre_match()`: Genre relevance scoring with sci-fi vs fantasy distinction
+- `_score_freshness()`: Recency bonus for variety
+- `_score_quality()`: Quality metrics (rating, votes, popularity)
+- `apply_mood_to_score()`: Mood-based adjustments with semantic matching
+- Final ranking: Multi-factor composite score
 
 ---
 
@@ -556,7 +705,7 @@ User feedback is automatically saved to `feedback/feedback.csv` with:
 - Timestamp
 - Session ID
 - Rating (positive/negative)
-- All preferences (genre, mood, duration, providers, language)
+- All preferences (genre, mood, providers, language)
 - Country
 - Number of suggestions shown
 - Optional user comment

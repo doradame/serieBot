@@ -20,7 +20,6 @@ The feedback file contains the following columns:
 | `rating` | User rating: `positive` or `negative` |
 | `genre` | Requested genre (e.g., sci-fi, comedy, drama) |
 | `mood` | Requested mood (e.g., intense, light-hearted) |
-| `duration` | Requested episode duration (e.g., <30m, ~45m, >60m) |
 | `providers` | Streaming providers requested (e.g., Netflix, Prime Video) |
 | `language` | Content language preference (e.g., en, it, any) |
 | `country` | User's country code (detected via geolocation) |
@@ -30,9 +29,9 @@ The feedback file contains the following columns:
 ## Example Entry
 
 ```csv
-timestamp,session_id,rating,genre,mood,duration,providers,language,country,suggestions_count,comment
-2025-10-28T12:54:33,20251028_125433,positive,sci-fi,intense,~45m,Netflix,en,IT,3,""
-2025-10-28T13:15:22,20251028_131522,negative,comedy,light-hearted,<30m,Disney+,en,US,2,"Not funny enough"
+timestamp,session_id,rating,genre,mood,providers,language,country,suggestions_count,comment
+2025-10-28T12:54:33,20251028_125433,positive,sci-fi,intense,Netflix,en,IT,3,""
+2025-10-28T13:15:22,20251028_131522,negative,comedy,light-hearted,Disney+,en,US,2,"Not funny enough"
 ```
 
 ## Usage
